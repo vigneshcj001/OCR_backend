@@ -4,5 +4,4 @@ pymongo
 python-dotenv
 pillow
 pytesseract
-bson
 python-multipart
