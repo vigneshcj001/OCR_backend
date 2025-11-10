@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pymongo
+python-dotenv
+pillow
+pytesseract
+bson
+python-multipart
