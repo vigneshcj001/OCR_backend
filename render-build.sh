@@ -1,12 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
-# Install system dependencies
-apt-get update
-apt-get install -y tesseract-ocr libleptonica-dev libtesseract-dev
-
-# Verify installation
-tesseract --version
-
-# Install Python dependencies
+# Render automatically runs apt installs if apt.txt is present
+echo "Installing Python dependencies..."
 pip install -r requirements.txt
+
+echo "✅ Build completed successfully."
