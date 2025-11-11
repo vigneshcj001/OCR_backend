@@ -55,21 +55,24 @@ class JSONEncoder:
 # OCR Extraction Logic
 # --------------------------
 def preprocess_image(content: bytes) -> np.ndarray:
-    """Read and preprocess image using OpenCV for OCR."""
-    # Convert bytes → NumPy array → OpenCV image
+    """Enhanced preprocessing for better OCR on address text."""
     file_bytes = np.frombuffer(content, np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
 
     # Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Denoise and threshold
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Enhance contrast
+    gray = cv2.equalizeHist(gray)
 
-    # Morphological opening (remove small noise)
-    kernel = np.ones((1, 1), np.uint8)
-    morph = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    # Adaptive threshold (better for faint text)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
+    )
+
+    # Morph closing to connect thin text
+    kernel = np.ones((2, 2), np.uint8)
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
     return morph
 
@@ -94,7 +97,7 @@ def extract_details(text: str):
     email = re.search(r"[\w\.-]+@[\w\.-]+", raw_text)
     data["email"] = email.group(0) if email else ""
 
-    # WEBSITE — fix "WWW. ceiyone. com" → "https://www.ceiyone.com"
+    # WEBSITE — fix OCR spacing like "WWW. ceiyone. com"
     website_match = re.search(
         r"(?:https?://)?(?:www[\s\.]*)?[A-Za-z0-9\-]+\s*(?:\.\s*[A-Za-z]{2,})(?:\s*\.\s*[A-Za-z]{2,})?",
         raw_text,
@@ -153,25 +156,32 @@ def extract_details(text: str):
             break
 
     # ------------------------
-    # ADDRESS FIX
+    # ADDRESS (Enhanced Logic)
     # ------------------------
     address_keywords = [
-        "road", "street", "st.", "lane", "nagar", "layout",
-        "block", "phase", "coimbatore", "chennai", "bangalore",
-        "delhi", "mumbai", "india", "tamil", "nadu", "district", "pincode"
+        "road", "street", "st", "lane", "nagar", "layout", "block", "phase",
+        "colony", "avenue", "main", "cross", "near", "opp", "building",
+        "coimbatore", "chennai", "bangalore", "delhi", "mumbai", "pune",
+        "hyderabad", "india", "tamil", "nadu", "district", "pin", "zip"
     ]
 
     address_candidates = []
     for l in lines:
         l_clean = l.lower()
-        # Must not include name, phone, email, or website lines
+        # skip lines that look like names, emails, or phones
         if any(x in l_clean for x in ["@", "www", "http", "linkedin", "+91", "phone", "tel"]):
             continue
         if any(kw in l_clean for kw in address_keywords):
             address_candidates.append(l.strip())
 
+    # If address still not found, try lines near the end of the card
+    if not address_candidates and len(lines) > 2:
+        possible_bottom_lines = lines[-3:]
+        for l in possible_bottom_lines:
+            if len(l.split()) > 3:  # long lines = probable address
+                address_candidates.append(l)
+
     if address_candidates:
-        # Merge consecutive address lines
         data["address"] = ", ".join(address_candidates)
 
     return data
@@ -232,5 +242,6 @@ def update_notes(card_id: str, payload: dict = Body(...)):
         return {"message": "No changes made", "data": new_notes}
     except Exception as e:
         return {"error": str(e)}
+
 
 
