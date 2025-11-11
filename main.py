@@ -176,3 +176,13 @@ async def upload_card(file: UploadFile = File(...)):
         }
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/all_cards")
+def get_all_cards():
+    try:
+        docs = list(collection.find())
+        return {"data": JSONEncoder.encode(docs)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
