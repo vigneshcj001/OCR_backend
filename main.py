@@ -94,9 +94,20 @@ def extract_details(text: str):
     email = re.search(r"[\w\.-]+@[\w\.-]+", raw_text)
     data["email"] = email.group(0) if email else ""
 
-    # WEBSITE
-    website = re.search(r"(https?://\S+|www\.\S+)", raw_text)
-    data["website"] = website.group(0) if website else ""
+    # WEBSITE (robust against spaces and OCR mistakes)
+    # Fix cases like "WWW. ceiyone. com" → "www.ceiyone.com"
+    website_match = re.search(
+        r"(?:https?://)?(?:www[\s\.]*)?[A-Za-z0-9\-]+\s*(?:\.\s*[A-Za-z]{2,})(?:\s*\.\s*[A-Za-z]{2,})?",
+        raw_text,
+        flags=re.I
+    )
+    if website_match:
+        cleaned = website_match.group(0)
+        cleaned = re.sub(r"\s*([\.])\s*", r"\1", cleaned)
+        cleaned = re.sub(r"\s+", "", cleaned)
+        if not cleaned.lower().startswith("http"):
+            cleaned = "https://" + cleaned.lower().replace("https://https://", "https://")
+        data["website"] = cleaned
 
     # PHONE NUMBERS
     phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
@@ -114,13 +125,13 @@ def extract_details(text: str):
     ]
     for line in lines:
         if any(kw in line.lower() for kw in designation_keywords):
-            data["designation"] = re.sub(r"fm.*", "", line, flags=re.I).strip()
+            data["designation"] = line.strip()
             break
 
     # COMPANY
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
-            data["company"] = line
+            data["company"] = line.strip()
             break
 
     # NAME
@@ -139,25 +150,19 @@ def extract_details(text: str):
         if alpha_ratio < 0.7:
             continue
         if clean.replace(" ", "").isupper():
-            data["name"] = clean.split()[0]
+            data["name"] = clean
             break
 
-    if not data["name"]:
-        for idx, line in enumerate(lines):
-            if data["designation"] and line == data["designation"] and idx > 0:
-                fallback = re.sub(r"[^A-Za-z ]", "", lines[idx - 1]).strip()
-                data["name"] = fallback.split()[0]
-                break
-
-    # ADDRESS
-    address_lines = []
+    # ADDRESS — detect lines with pin codes or city/state keywords
+    address_candidates = []
     for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)", l, re.I):
-            address_lines.append(l)
-    if address_lines:
-        data["address"] = ", ".join(address_lines)
+        if re.search(r"(coimbatore|tamil|india|\d{3,6}|road|nagar|street|lane|city|district)", l, re.I):
+            address_candidates.append(l)
+    if address_candidates:
+        data["address"] = ", ".join(address_candidates)
 
     return data
+
 
 
 # --------------------------
@@ -215,3 +220,4 @@ def update_notes(card_id: str, payload: dict = Body(...)):
         return {"message": "No changes made", "data": new_notes}
     except Exception as e:
         return {"error": str(e)}
+
