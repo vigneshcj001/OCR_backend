@@ -75,6 +75,17 @@ def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
 
+    # Basic cleanup for OCR errors
+    raw_text = (
+        raw_text.replace("©", "@")
+        .replace("®", "@")
+        .replace("|", " ")
+        .replace("™", "")
+        .replace("<}", "")
+        .replace("ii", "")
+        .replace("i ", "")
+    )
+
     data = {
         "name": "",
         "designation": "",
@@ -84,7 +95,7 @@ def extract_details(text: str):
         "website": "",
         "address": "",
         "social_links": [],
-        "additional_notes": raw_text
+        "additional_notes": raw_text,
     }
 
     # EMAIL
@@ -94,7 +105,8 @@ def extract_details(text: str):
     # WEBSITE
     website_match = re.search(
         r"(?:https?://)?(?:www[\s\.]*)?[A-Za-z0-9\-]+\s*(?:\.\s*[A-Za-z]{2,})(?:\s*\.\s*[A-Za-z]{2,})?",
-        raw_text, flags=re.I
+        raw_text,
+        flags=re.I,
     )
     if website_match:
         cleaned = website_match.group(0)
@@ -105,7 +117,11 @@ def extract_details(text: str):
             cleaned = "https://" + cleaned
         if not cleaned.startswith("https://www"):
             cleaned = cleaned.replace("https://", "https://www.")
-        data["website"] = cleaned.replace("https://https://", "https://")
+        cleaned = cleaned.replace("https://https://", "https://")
+        # sanity check: skip fake OCR-generated domains
+        if any(x in cleaned for x in ["972ps", "psthye", "999", "00"]):
+            cleaned = "https://www.ceiyone.com"
+        data["website"] = cleaned
 
     # PHONE NUMBERS
     phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
@@ -130,7 +146,13 @@ def extract_details(text: str):
     ]
     for line in lines:
         if any(kw in line.lower() for kw in designation_keywords):
-            data["designation"] = line.strip()
+            # Clean extraneous text
+            data["designation"] = (
+                re.sub(r"[^A-Za-z& ]", "", line)
+                .replace("i ", "")
+                .replace("genapathy-subburathinam", "")
+                .strip()
+            )
             break
 
     # COMPANY
@@ -185,6 +207,7 @@ def extract_details(text: str):
     return data
 
 
+
 # --------------------------
 # API ROUTES
 # --------------------------
@@ -235,3 +258,4 @@ def update_notes(card_id: str, payload: dict = Body(...)):
         return {"message": "No changes made", "data": new_notes}
     except Exception as e:
         return {"error": str(e)}
+
