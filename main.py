@@ -1,22 +1,17 @@
 from fastapi import FastAPI, File, UploadFile
-from pymongo import MongoClient
 from fastapi.middleware.cors import CORSMiddleware
+from pymongo import MongoClient
+from bson import ObjectId
 from PIL import Image
 import pytesseract
 import io
-import re
-from bson import ObjectId
-from dotenv import load_dotenv
 import os
+import re
+from dotenv import load_dotenv
 
-# Load .env
+# Load ENV
 load_dotenv()
-
-# ENV variables
 MONGO_URI = os.getenv("MONGO_URI")
-
-# On Linux (Render), don't set tesseract_cmd unless using custom path
-# pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_PATH", "tesseract")
 
 app = FastAPI()
 
@@ -25,18 +20,37 @@ client = MongoClient(MONGO_URI)
 db = client["business_cards"]
 collection = db["contacts"]
 
-# CORS Settings
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
+# --------------------------
+# JSON Encoder
+# --------------------------
+class JSONEncoder:
+    @staticmethod
+    def encode(doc):
+        if isinstance(doc, ObjectId):
+            return str(doc)
+        if isinstance(doc, dict):
+            return {k: JSONEncoder.encode(v) for k, v in doc.items()}
+        if isinstance(doc, list):
+            return [JSONEncoder.encode(x) for x in doc]
+        return doc
+
+
+# --------------------------
+# OCR Extraction Logic (Improved)
+# --------------------------
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
-    full_text = " ".join(lines)
+    raw_text = " ".join(lines)
+    lower_text = raw_text.lower()
 
     data = {
         "name": "",
@@ -47,70 +61,86 @@ def extract_details(text: str):
         "website": "",
         "address": "",
         "social_links": [],
-        "additional_notes": full_text
+        "additional_notes": raw_text
     }
 
-    email_match = re.search(r"[\w\.-]+@[\w\.-]+", full_text)
-    website_match = re.search(r"(https?://\S+|www\.\S+)", full_text)
-    phones = re.findall(r"\+?\d[\d\- ]{7,}\d", full_text)
+    # EMAIL
+    email = re.search(r"[\w\.-]+@[\w\.-]+", raw_text)
+    data["email"] = email.group(0) if email else ""
 
-    data["email"] = email_match.group(0) if email_match else ""
-    data["website"] = website_match.group(0) if website_match else ""
+    # WEBSITE
+    website = re.search(r"(https?://\S+|www\.\S+)", raw_text)
+    data["website"] = website.group(0) if website else ""
+
+    # PHONE NUMBERS
+    phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
     data["phone_numbers"] = list(set(phones))
 
-    for i, line in enumerate(lines):
-        if re.search(r"manager|director|engineer|founder|ceo|head|lead|consultant", line, re.I):
+    # SOCIAL (LinkedIn IDs, etc.)
+    for l in lines:
+        if "linkedin" in l.lower() or "in/" in l.lower():
+            data["social_links"].append(l)
+
+    # DESIGNATION
+    designation_keywords = [
+        "founder", "ceo", "cto", "coo", "manager", "director",
+        "engineer", "consultant", "head", "lead"
+    ]
+
+    for line in lines:
+        if any(kw in line.lower() for kw in designation_keywords):
             data["designation"] = line
-            if i > 0:
-                data["name"] = lines[i - 1]
             break
 
-    company_candidates = [l for l in lines if re.search(r"Pvt|Ltd|Inc|Corporation|Company", l, re.I)]
-    if company_candidates:
-        data["company"] = company_candidates[0]
+    # COMPANY (Pvt Ltd, LLP etc.)
+    for line in lines:
+        if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
+            data["company"] = line
+            break
 
-    addr_candidates = [
-        l for l in lines if re.search(r"\d.*(Street|St|Road|Ave|City|State|Avenue)", l, re.I)
-    ]
-    if addr_candidates:
-        data["address"] = " ".join(addr_candidates)
+    # NAME (line above designation)
+    if data["designation"]:
+        idx = lines.index(data["designation"])
+        if idx > 0:
+            candidate = lines[idx - 1]
+            if "@" not in candidate and "www" not in candidate.lower():
+                data["name"] = candidate
+
+    # ADDRESS
+    address_lines = []
+    for l in lines:
+        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|pincode|641)", l, re.I):
+            address_lines.append(l)
+
+    if address_lines:
+        data["address"] = ", ".join(address_lines)
 
     return data
 
-class JSONEncoder:
-    @staticmethod
-    def encode_document(doc):
-        if isinstance(doc, list):
-            return [JSONEncoder.encode_document(x) for x in doc]
-        if isinstance(doc, dict):
-            return {k: JSONEncoder.encode_document(v) for k, v in doc.items()}
-        if isinstance(doc, ObjectId):
-            return str(doc)
-        return doc
 
+# --------------------------
+# API ROUTES
+# --------------------------
 @app.get("/")
 def root():
-    return {"message": "OCR Backend Running Successfully 🚀"}
+    return {"message": "OCR Backend Running ✅"}
+
 
 @app.post("/upload_card")
 async def upload_card(file: UploadFile = File(...)):
-    if not file:
-        return {"error": "No file uploaded"}
-    contents = await file.read()
-    if not contents:
-        return {"error": "Empty file uploaded"}
-
     try:
-        image = Image.open(io.BytesIO(contents))
-        text = pytesseract.image_to_string(image)
-        data = extract_details(text)
+        content = await file.read()
+        img = Image.open(io.BytesIO(content))
 
-        result = collection.insert_one(data)
-        inserted_data = collection.find_one({"_id": result.inserted_id})
+        text = pytesseract.image_to_string(img)
+        extracted = extract_details(text)
+
+        result = collection.insert_one(extracted)
+        inserted = collection.find_one({"_id": result.inserted_id})
 
         return {
-            "message": "Card inserted successfully",
-            "data": JSONEncoder.encode_document(inserted_data)
+            "message": "Inserted Successfully",
+            "data": JSONEncoder.encode(inserted)
         }
 
     except Exception as e:
