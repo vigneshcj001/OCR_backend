@@ -95,7 +95,9 @@ class JSONEncoder:
             return str(doc)
         return doc
 
-
+@app.get("/")
+def root():
+    return {"message": "OCR Backend Running Successfully 🚀"}
 @app.post("/upload_card")
 async def upload_card(file: UploadFile = File(...)):
     try:
@@ -113,3 +115,4 @@ async def upload_card(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"error": str(e)}
+
