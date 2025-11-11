@@ -94,8 +94,7 @@ def extract_details(text: str):
     email = re.search(r"[\w\.-]+@[\w\.-]+", raw_text)
     data["email"] = email.group(0) if email else ""
 
-    # WEBSITE (robust against spaces and OCR mistakes)
-    # Fix cases like "WWW. ceiyone. com" → "www.ceiyone.com"
+    # WEBSITE — fix "WWW. ceiyone. com" → "https://www.ceiyone.com"
     website_match = re.search(
         r"(?:https?://)?(?:www[\s\.]*)?[A-Za-z0-9\-]+\s*(?:\.\s*[A-Za-z]{2,})(?:\s*\.\s*[A-Za-z]{2,})?",
         raw_text,
@@ -153,16 +152,29 @@ def extract_details(text: str):
             data["name"] = clean
             break
 
-    # ADDRESS — detect lines with pin codes or city/state keywords
+    # ------------------------
+    # ADDRESS FIX
+    # ------------------------
+    address_keywords = [
+        "road", "street", "st.", "lane", "nagar", "layout",
+        "block", "phase", "coimbatore", "chennai", "bangalore",
+        "delhi", "mumbai", "india", "tamil", "nadu", "district", "pincode"
+    ]
+
     address_candidates = []
     for l in lines:
-        if re.search(r"(coimbatore|tamil|india|\d{3,6}|road|nagar|street|lane|city|district)", l, re.I):
-            address_candidates.append(l)
+        l_clean = l.lower()
+        # Must not include name, phone, email, or website lines
+        if any(x in l_clean for x in ["@", "www", "http", "linkedin", "+91", "phone", "tel"]):
+            continue
+        if any(kw in l_clean for kw in address_keywords):
+            address_candidates.append(l.strip())
+
     if address_candidates:
+        # Merge consecutive address lines
         data["address"] = ", ".join(address_candidates)
 
     return data
-
 
 
 # --------------------------
@@ -220,4 +232,5 @@ def update_notes(card_id: str, payload: dict = Body(...)):
         return {"message": "No changes made", "data": new_notes}
     except Exception as e:
         return {"error": str(e)}
+
 
