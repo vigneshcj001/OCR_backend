@@ -1,7 +1,6 @@
 from fastapi import FastAPI, File, UploadFile
 from pymongo import MongoClient
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
 from PIL import Image
 import pytesseract
 import io
@@ -15,10 +14,9 @@ load_dotenv()
 
 # ENV variables
 MONGO_URI = os.getenv("MONGO_URI")
-TESSERACT_PATH = os.getenv("TESSERACT_PATH")
 
-# Tesseract path (Windows)
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+# On Linux (Render), don't set tesseract_cmd unless using custom path
+# pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_PATH", "tesseract")
 
 app = FastAPI()
 
@@ -37,7 +35,6 @@ app.add_middleware(
 )
 
 def extract_details(text: str):
-    """Extract structured details from OCR text"""
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     full_text = " ".join(lines)
 
@@ -61,7 +58,6 @@ def extract_details(text: str):
     data["website"] = website_match.group(0) if website_match else ""
     data["phone_numbers"] = list(set(phones))
 
-    # Detect designation → name is line above
     for i, line in enumerate(lines):
         if re.search(r"manager|director|engineer|founder|ceo|head|lead|consultant", line, re.I):
             data["designation"] = line
@@ -69,12 +65,10 @@ def extract_details(text: str):
                 data["name"] = lines[i - 1]
             break
 
-    # Company detection
     company_candidates = [l for l in lines if re.search(r"Pvt|Ltd|Inc|Corporation|Company", l, re.I)]
     if company_candidates:
         data["company"] = company_candidates[0]
 
-    # Address detection
     addr_candidates = [
         l for l in lines if re.search(r"\d.*(Street|St|Road|Ave|City|State|Avenue)", l, re.I)
     ]
@@ -82,7 +76,6 @@ def extract_details(text: str):
         data["address"] = " ".join(addr_candidates)
 
     return data
-
 
 class JSONEncoder:
     @staticmethod
@@ -98,10 +91,17 @@ class JSONEncoder:
 @app.get("/")
 def root():
     return {"message": "OCR Backend Running Successfully 🚀"}
+
 @app.post("/upload_card")
 async def upload_card(file: UploadFile = File(...)):
+    if not file:
+        return {"error": "No file uploaded"}
+    contents = await file.read()
+    if not contents:
+        return {"error": "Empty file uploaded"}
+
     try:
-        image = Image.open(io.BytesIO(await file.read()))
+        image = Image.open(io.BytesIO(contents))
         text = pytesseract.image_to_string(image)
         data = extract_details(text)
 
@@ -115,4 +115,3 @@ async def upload_card(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"error": str(e)}
-
