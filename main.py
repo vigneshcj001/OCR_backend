@@ -46,7 +46,6 @@ class JSONEncoder:
 
 # --------------------------
 # OCR Extraction Logic (Improved)
-# --------------------------
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -81,7 +80,9 @@ def extract_details(text: str):
         if "linkedin" in l.lower() or "in/" in l.lower():
             data["social_links"].append(l)
 
-    # DESIGNATION
+    # -------------------------------------
+    # FIX #1 → CLEAN DESIGNATION
+    # -------------------------------------
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager", "director",
         "engineer", "consultant", "head", "lead"
@@ -89,17 +90,32 @@ def extract_details(text: str):
 
     for line in lines:
         if any(kw in line.lower() for kw in designation_keywords):
-            data["designation"] = line
+            # remove junk like "fm ..."
+            cleaned = re.sub(r"fm.*", "", line, flags=re.I).strip()
+            data["designation"] = cleaned
             break
 
-    # COMPANY (Pvt Ltd, LLP etc.)
+    # COMPANY
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
             data["company"] = line
             break
 
-    # NAME (line above designation)
-    if data["designation"]:
+    # -------------------------------------
+    # FIX #2 → BEST NAME EXTRACTION LOGIC
+    # Extract two consecutive uppercase word lines
+    # -------------------------------------
+    uppercase_lines = []
+    for line in lines:
+        if re.fullmatch(r"[A-Z ]{5,}", line.replace(" ", "")):
+            uppercase_lines.append(line)
+
+    # If two lines are uppercase (like your card)
+    if len(uppercase_lines) >= 2:
+        data["name"] = " ".join(uppercase_lines[:2])
+
+    # If still empty → fallback: line before designation
+    if not data["name"] and data["designation"]:
         idx = lines.index(data["designation"])
         if idx > 0:
             candidate = lines[idx - 1]
@@ -116,6 +132,7 @@ def extract_details(text: str):
         data["address"] = ", ".join(address_lines)
 
     return data
+
 
 
 # --------------------------
@@ -145,3 +162,4 @@ async def upload_card(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"error": str(e)}
+
