@@ -102,8 +102,9 @@ def extract_details(text: str):
             data["company"] = line
             break
 
-    # ---------------- NAME EXTRACTION (Enhanced) ----------------
+    # ---------------- NAME EXTRACTION (Improved for multi-line uppercase names) ----------------
     company_words = data["company"].lower().split() if data["company"] else []
+    uppercase_lines = []
 
     for l in lines:
         clean = re.sub(r"[^A-Za-z ]", "", l).strip()
@@ -119,13 +120,13 @@ def extract_details(text: str):
         if alpha_ratio < 0.7:
             continue
         if clean.replace(" ", "").isupper():
-            # ✅ Capture full uppercase line (e.g. GANAPATHY SUBBURATHINAM)
-            words = clean.split()
-            if len(words) >= 2:
-                data["name"] = " ".join(words[:2])  # First + Last name
-            else:
-                data["name"] = words[0]
-            break
+            uppercase_lines.append(clean)
+
+    # ✅ Join consecutive uppercase lines (handles “GANAPATHY” + “SUBBURATHINAM”)
+    if len(uppercase_lines) >= 2:
+        data["name"] = " ".join(uppercase_lines[:2])
+    elif uppercase_lines:
+        data["name"] = uppercase_lines[0]
 
     # Fallback: name above designation if not found
     if not data["name"]:
