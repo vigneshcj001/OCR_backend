@@ -62,6 +62,7 @@ def extract_details(text: str):
         "additional_notes": raw_text
     }
 
+    # -----------------------------------------
     # EMAIL
     email = re.search(r"[\w\.-]+@[\w\.-]+", raw_text)
     data["email"] = email.group(0) if email else ""
@@ -70,7 +71,7 @@ def extract_details(text: str):
     website = re.search(r"(https?://\S+|www\.\S+)", raw_text)
     data["website"] = website.group(0) if website else ""
 
-    # PHONE NUMBERS
+    # PHONE
     phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
     data["phone_numbers"] = list(set(phones))
 
@@ -79,12 +80,11 @@ def extract_details(text: str):
         if "linkedin" in l.lower() or "in/" in l.lower():
             data["social_links"].append(l)
 
-    # ---------------------------------------------------
-    # FIXED: IDENTIFY DESIGNATION AND ORIGINAL INDEX
-    # ---------------------------------------------------
+    # -----------------------------------------
+    # DESIGNATION
     designation_keywords = [
-        "founder", "ceo", "cto", "coo", "manager", "director",
-        "engineer", "consultant", "head", "lead"
+        "founder", "ceo", "cto", "coo", "manager",
+        "director", "engineer", "consultant", "head", "lead"
     ]
 
     designation_index = None
@@ -96,40 +96,60 @@ def extract_details(text: str):
             designation_line = line
             break
 
-    # Clean designation (remove 'fm ...')
     if designation_line:
         cleaned_designation = re.sub(r"fm.*", "", designation_line, flags=re.I).strip()
         data["designation"] = cleaned_designation
 
-    # ---------------------------------------------------
+    # -----------------------------------------
     # COMPANY
-    # ---------------------------------------------------
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
             data["company"] = line
             break
 
-    # ---------------------------------------------------
-    # NAME EXTRACTION
-    # 1. Use two uppercase consecutive lines (BEST)
-    # ---------------------------------------------------
-    uppercase_lines = [l for l in lines if l.replace(" ", "").isupper()]
+    # -----------------------------------------
+    # ✅ FIX: EXTREMELY ROBUST NAME DETECTION
+    # -----------------------------------------
+    cleaned_name_lines = []
 
-    if len(uppercase_lines) >= 2:
-        data["name"] = " ".join(uppercase_lines[:2])
+    for l in lines:
+        clean = re.sub(r"[^A-Za-z ]", "", l).strip()  # remove symbols like ©
+        if not clean:
+            continue
 
-    # Fallback → use line above designation
-    if not data["name"] and designation_index is not None and designation_index > 0:
-        possible_name = lines[designation_index - 1]
-        if "@" not in possible_name and "www" not in possible_name.lower():
-            data["name"] = possible_name
+        # Must be mostly alphabetic
+        if len(re.findall(r"[A-Za-z]", clean)) < len(clean) * 0.6:
+            continue
 
-    # ---------------------------------------------------
+        # Must NOT be phone/email/website
+        if "@" in clean or "www" in clean.lower():
+            continue
+
+        # Avoid designation keywords
+        if any(kw in clean.lower() for kw in designation_keywords):
+            continue
+
+        # Name is usually 1–3 words, each capitalized
+        if all(w.isalpha() and w[0].isupper() for w in clean.split()):
+            cleaned_name_lines.append(clean)
+
+    # If we found strong candidate lines
+    if len(cleaned_name_lines) >= 2:
+        data["name"] = " ".join(cleaned_name_lines[:2])
+    elif len(cleaned_name_lines) == 1:
+        data["name"] = cleaned_name_lines[0]
+
+    # Fallback: line above designation
+    if not data["name"] and designation_index and designation_index > 0:
+        fallback = lines[designation_index - 1]
+        clean_fallback = re.sub(r"[^A-Za-z ]", "", fallback).strip()
+        data["name"] = clean_fallback
+
+    # -----------------------------------------
     # ADDRESS
-    # ---------------------------------------------------
     address_lines = []
     for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|pincode|641)", l, re.I):
+        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)", l, re.I):
             address_lines.append(l)
 
     if address_lines:
@@ -165,4 +185,5 @@ async def upload_card(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"error": str(e)}
+
 
