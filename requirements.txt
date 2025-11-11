@@ -1,7 +1,7 @@
 fastapi
 uvicorn
+pytesseract
+pillow
+python-multipart
 pymongo
 python-dotenv
-pillow
-pytesseract
-python-multipart
