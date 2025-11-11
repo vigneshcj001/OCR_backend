@@ -45,7 +45,7 @@ class JSONEncoder:
 
 
 # --------------------------
-# OCR Extraction Logic (Final Version)
+# OCR Extraction Logic (Only FIRST NAME)
 # --------------------------
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -77,7 +77,7 @@ def extract_details(text: str):
     data["phone_numbers"] = list(set(phones))
 
     # -----------------------------------------
-    # SOCIAL LINKS
+    # SOCIAL
     for l in lines:
         if "linkedin" in l.lower() or "in/" in l.lower():
             data["social_links"].append(l)
@@ -89,84 +89,66 @@ def extract_details(text: str):
         "director", "engineer", "consultant", "head", "lead"
     ]
 
-    designation_index = None
-    designation_line = None
-
-    for i, line in enumerate(lines):
+    for line in lines:
         if any(kw in line.lower() for kw in designation_keywords):
-            designation_index = i
-            designation_line = line
+            data["designation"] = re.sub(r"fm.*", "", line, flags=re.I).strip()
             break
 
-    if designation_line:
-        cleaned_designation = re.sub(r"fm.*", "", designation_line, flags=re.I).strip()
-        data["designation"] = cleaned_designation
-
     # -----------------------------------------
-    # COMPANY EXTRACTION
+    # COMPANY
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
             data["company"] = line
             break
 
     # -----------------------------------------
-    # ✅ FINAL: PERFECT NAME DETECTION LOGIC
+    # ✅✅ ONLY FIRST NAME EXTRACTION
     # -----------------------------------------
     company_words = []
     if data["company"]:
         company_words = data["company"].lower().split()
-
-    name_candidates = []
 
     for l in lines:
         clean = re.sub(r"[^A-Za-z ]", "", l).strip()
         if not clean:
             continue
 
-        # Skip company words
+        # skip company
         if any(w in clean.lower() for w in company_words):
             continue
 
-        # Skip email/phone/website
+        # skip email/phone/website/designation lines
         if "@" in clean or "www" in clean.lower():
             continue
-
-        # Skip designation
         if any(kw in clean.lower() for kw in designation_keywords):
             continue
 
-        # Must be alphabetic-heavy
+        # must be alphabet-heavy
         alpha_ratio = len(re.findall(r"[A-Za-z]", clean)) / max(1, len(clean))
         if alpha_ratio < 0.7:
             continue
 
-        # Name words must be capitalized
-        if all(w.isalpha() and w[0].isupper() for w in clean.split()):
-            name_candidates.append(clean)
+        # must be uppercase (typical name style)
+        if clean.replace(" ", "").isupper():
+            # ✅ pick ONLY the FIRST NAME
+            data["name"] = clean.split()[0]
+            break
 
-    # FIX: surname split issue: "SUBBURATHIN AM" → "SUBBURATHINAM"
-    cleaned = [n.replace(" ", "") for n in name_candidates]
-
-    # Combine first name + last name
-    if len(cleaned) >= 2:
-        data["name"] = f"{cleaned[0]} {cleaned[1]}"
-    elif len(cleaned) == 1:
-        data["name"] = cleaned[0]
-
-    # fallback
-    if not data["name"] and designation_index and designation_index > 0:
-        fallback = lines[designation_index - 1]
-        data["name"] = re.sub(r"[^A-Za-z ]", "", fallback).strip()
+    # fallback above designation
+    if not data["name"]:
+        for line in lines:
+            if data["designation"] and line == data["designation"]:
+                idx = lines.index(line)
+                if idx > 0:
+                    fallback = re.sub(r"[^A-Za-z ]", "", lines[idx - 1]).strip()
+                    data["name"] = fallback.split()[0]  # first word only
+                break
 
     # -----------------------------------------
-    # ADDRESS DETECTION
+    # ADDRESS
     address_lines = []
     for l in lines:
-        if re.search(
-            r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)",
-            l,
-            re.I,
-        ):
+        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)", l, re.I):
             address_lines.append(l)
 
     if address_lines:
