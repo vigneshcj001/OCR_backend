@@ -102,7 +102,7 @@ def extract_details(text: str):
             data["company"] = line
             break
 
-    # ---------------- NAME EXTRACTION ----------------
+    # ---------------- NAME EXTRACTION (Enhanced) ----------------
     company_words = data["company"].lower().split() if data["company"] else []
 
     for l in lines:
@@ -119,7 +119,12 @@ def extract_details(text: str):
         if alpha_ratio < 0.7:
             continue
         if clean.replace(" ", "").isupper():
-            data["name"] = clean.split()[0]
+            # ✅ Capture full uppercase line (e.g. GANAPATHY SUBBURATHINAM)
+            words = clean.split()
+            if len(words) >= 2:
+                data["name"] = " ".join(words[:2])  # First + Last name
+            else:
+                data["name"] = words[0]
             break
 
     # Fallback: name above designation if not found
@@ -127,7 +132,7 @@ def extract_details(text: str):
         for idx, line in enumerate(lines):
             if data["designation"] and line == data["designation"] and idx > 0:
                 fallback = re.sub(r"[^A-Za-z ]", "", lines[idx - 1]).strip()
-                data["name"] = fallback.split()[0]
+                data["name"] = fallback
                 break
 
     # ---------------- ADDRESS ----------------
