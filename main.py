@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from bson import ObjectId
@@ -8,6 +8,8 @@ import io
 import os
 import re
 from dotenv import load_dotenv
+from datetime import datetime
+import pytz
 
 # --------------------------
 # Load ENV
@@ -49,7 +51,7 @@ class JSONEncoder:
         return doc
 
 # --------------------------
-# OCR Extraction Logic (Only FIRST NAME)
+# OCR Extraction Logic
 # --------------------------
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -67,34 +69,24 @@ def extract_details(text: str):
         "additional_notes": raw_text
     }
 
-    # --------------------------
     # EMAIL
-    # --------------------------
     email = re.search(r"[\w\.-]+@[\w\.-]+", raw_text)
     data["email"] = email.group(0) if email else ""
 
-    # --------------------------
     # WEBSITE
-    # --------------------------
     website = re.search(r"(https?://\S+|www\.\S+)", raw_text)
     data["website"] = website.group(0) if website else ""
 
-    # --------------------------
     # PHONE NUMBERS
-    # --------------------------
     phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
     data["phone_numbers"] = list(set(phones))
 
-    # --------------------------
     # SOCIAL LINKS
-    # --------------------------
     for l in lines:
         if "linkedin" in l.lower() or "in/" in l.lower():
             data["social_links"].append(l)
 
-    # --------------------------
     # DESIGNATION
-    # --------------------------
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager",
         "director", "engineer", "consultant", "head", "lead"
@@ -104,17 +96,13 @@ def extract_details(text: str):
             data["designation"] = re.sub(r"fm.*", "", line, flags=re.I).strip()
             break
 
-    # --------------------------
     # COMPANY
-    # --------------------------
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
             data["company"] = line
             break
 
-    # --------------------------
     # FIRST NAME EXTRACTION
-    # --------------------------
     company_words = data["company"].lower().split() if data["company"] else []
 
     for l in lines:
@@ -142,9 +130,7 @@ def extract_details(text: str):
                 data["name"] = fallback.split()[0]
                 break
 
-    # --------------------------
     # ADDRESS
-    # --------------------------
     address_lines = []
     for l in lines:
         if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)", l, re.I):
@@ -161,6 +147,7 @@ def extract_details(text: str):
 def root():
     return {"message": "OCR Backend Running ✅"}
 
+# Upload card
 @app.post("/upload_card")
 async def upload_card(file: UploadFile = File(...)):
     try:
@@ -168,6 +155,11 @@ async def upload_card(file: UploadFile = File(...)):
         img = Image.open(io.BytesIO(content))
         text = pytesseract.image_to_string(img)
         extracted = extract_details(text)
+
+        # Add created_at in IST
+        ist = pytz.timezone("Asia/Kolkata")
+        extracted["created_at"] = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
+
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
         return {
@@ -177,6 +169,7 @@ async def upload_card(file: UploadFile = File(...)):
     except Exception as e:
         return {"error": str(e)}
 
+# Fetch all cards
 @app.get("/all_cards")
 def get_all_cards():
     try:
@@ -185,4 +178,16 @@ def get_all_cards():
     except Exception as e:
         return {"error": str(e)}
 
-
+# Update Notes
+@app.put("/update_notes/{card_id}")
+def update_notes(card_id: str, payload: dict = Body(...)):
+    try:
+        result = collection.update_one(
+            {"_id": ObjectId(card_id)},
+            {"$set": {"additional_notes": payload.get("additional_notes", "")}}
+        )
+        if result.modified_count:
+            return {"message": "Notes updated successfully"}
+        return {"message": "No changes made"}
+    except Exception as e:
+        return {"error": str(e)}
