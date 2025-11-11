@@ -8,7 +8,6 @@ import io
 import os
 import re
 from dotenv import load_dotenv
-from difflib import get_close_matches
 
 # --------------------------
 # Load ENV
@@ -17,7 +16,7 @@ load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI")
 
 # --------------------------
-# FastAPI + MongoDB Setup
+# FastAPI & MongoDB Setup
 # --------------------------
 app = FastAPI()
 
@@ -25,6 +24,9 @@ client = MongoClient(MONGO_URI)
 db = client["business_cards"]
 collection = db["contacts"]
 
+# --------------------------
+# CORS Middleware
+# --------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -47,19 +49,7 @@ class JSONEncoder:
         return doc
 
 # --------------------------
-# States list (India + global examples)
-# --------------------------
-states = [
-    'Andhra Pradesh', 'Arunachal Pradesh', 'Assam', 'Bihar', 'Chhattisgarh', 'Goa', 'Gujarat', 
-    'Haryana','Hyderabad', 'Himachal Pradesh', 'Jharkhand', 'Karnataka', 'Kerala', 'Madhya Pradesh',
-    'Maharashtra', 'Manipur', 'Meghalaya', 'Mizoram', 'Nagaland', 'Odisha', 'Punjab', 
-    'Rajasthan', 'Sikkim', 'Tamil Nadu', 'Telangana', 'Tripura', 'Uttar Pradesh', 'Uttarakhand', 'West Bengal',
-    "United States", "China", "Japan", "Germany", "United Kingdom", "France", "India", 
-    "Canada", "Italy", "South Korea", "Russia", "Australia", "Brazil", "Spain", "Mexico", 'USA','UK'
-]
-
-# --------------------------
-# OCR Extraction Function
+# OCR Extraction Logic (Only FIRST NAME)
 # --------------------------
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -73,34 +63,38 @@ def extract_details(text: str):
         "email": "",
         "website": "",
         "address": "",
-        "state": "",
         "social_links": [],
         "additional_notes": raw_text
     }
 
     # --------------------------
     # EMAIL
+    # --------------------------
     email = re.search(r"[\w\.-]+@[\w\.-]+", raw_text)
     data["email"] = email.group(0) if email else ""
 
     # --------------------------
     # WEBSITE
+    # --------------------------
     website = re.search(r"(https?://\S+|www\.\S+)", raw_text)
     data["website"] = website.group(0) if website else ""
 
     # --------------------------
-    # PHONE
+    # PHONE NUMBERS
+    # --------------------------
     phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
     data["phone_numbers"] = list(set(phones))
 
     # --------------------------
     # SOCIAL LINKS
+    # --------------------------
     for l in lines:
-        if "linkedin" in l.lower() or "in/" in l.lower() or "twitter" in l.lower() or "facebook" in l.lower():
+        if "linkedin" in l.lower() or "in/" in l.lower():
             data["social_links"].append(l)
 
     # --------------------------
     # DESIGNATION
+    # --------------------------
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager",
         "director", "engineer", "consultant", "head", "lead"
@@ -112,6 +106,7 @@ def extract_details(text: str):
 
     # --------------------------
     # COMPANY
+    # --------------------------
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
             data["company"] = line
@@ -119,9 +114,8 @@ def extract_details(text: str):
 
     # --------------------------
     # FIRST NAME EXTRACTION
-    company_words = []
-    if data["company"]:
-        company_words = data["company"].lower().split()
+    # --------------------------
+    company_words = data["company"].lower().split() if data["company"] else []
 
     for l in lines:
         clean = re.sub(r"[^A-Za-z ]", "", l).strip()
@@ -140,34 +134,23 @@ def extract_details(text: str):
             data["name"] = clean.split()[0]
             break
 
+    # Fallback: name above designation if not found
     if not data["name"]:
         for idx, line in enumerate(lines):
-            if line == data["designation"] and idx > 0:
+            if data["designation"] and line == data["designation"] and idx > 0:
                 fallback = re.sub(r"[^A-Za-z ]", "", lines[idx - 1]).strip()
                 data["name"] = fallback.split()[0]
                 break
 
     # --------------------------
-    # ADDRESS EXTRACTION
-    address_keywords = [
-        'road', 'floor', 'st', 'street', 'district', 'near', 'beside', 'opposite', 
-        'at', 'in', 'center', 'main road', 'state', 'country', 'post', 'zip', 'city', 
-        'zone','mandal','town','rural','circle','next to','across from','area',
-        'building','towers','village','nagar','lane'
-    ]
-    postal_code_pattern = r'\b\d{5,6}\b'
-
+    # ADDRESS
+    # --------------------------
     address_lines = []
     for l in lines:
-        line_lower = l.lower()
-        if any(kw in line_lower for kw in address_keywords) or re.search(postal_code_pattern, l):
+        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)", l, re.I):
             address_lines.append(l)
-    data["address"] = ", ".join(address_lines) if address_lines else ""
-
-    # --------------------------
-    # STATE DETECTION
-    state_match = get_close_matches(raw_text, states, n=1, cutoff=0.6)
-    data["state"] = state_match[0] if state_match else ""
+    if address_lines:
+        data["address"] = ", ".join(address_lines)
 
     return data
 
@@ -185,14 +168,11 @@ async def upload_card(file: UploadFile = File(...)):
         img = Image.open(io.BytesIO(content))
         text = pytesseract.image_to_string(img)
         extracted = extract_details(text)
-
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
-
         return {
             "message": "Inserted Successfully",
             "data": JSONEncoder.encode(inserted)
         }
-
     except Exception as e:
         return {"error": str(e)}
