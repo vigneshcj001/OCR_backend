@@ -2,8 +2,9 @@ from fastapi import FastAPI, File, UploadFile, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from bson import ObjectId
-from PIL import Image
 import pytesseract
+import cv2
+import numpy as np
 import io
 import os
 import re
@@ -53,6 +54,26 @@ class JSONEncoder:
 # --------------------------
 # OCR Extraction Logic
 # --------------------------
+def preprocess_image(content: bytes) -> np.ndarray:
+    """Read and preprocess image using OpenCV for OCR."""
+    # Convert bytes → NumPy array → OpenCV image
+    file_bytes = np.frombuffer(content, np.uint8)
+    img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Denoise and threshold
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Morphological opening (remove small noise)
+    kernel = np.ones((1, 1), np.uint8)
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+    return morph
+
+
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -102,7 +123,7 @@ def extract_details(text: str):
             data["company"] = line
             break
 
-    # NAME EXTRACTION
+    # NAME
     company_words = data["company"].lower().split() if data["company"] else []
     for l in lines:
         clean = re.sub(r"[^A-Za-z ]", "", l).strip()
@@ -121,7 +142,6 @@ def extract_details(text: str):
             data["name"] = clean.split()[0]
             break
 
-    # Fallback name
     if not data["name"]:
         for idx, line in enumerate(lines):
             if data["designation"] and line == data["designation"] and idx > 0:
@@ -139,6 +159,7 @@ def extract_details(text: str):
 
     return data
 
+
 # --------------------------
 # API ROUTES
 # --------------------------
@@ -146,29 +167,32 @@ def extract_details(text: str):
 def root():
     return {"message": "OCR Backend Running ✅"}
 
-# Upload card
+
 @app.post("/upload_card")
 async def upload_card(file: UploadFile = File(...)):
     try:
+        # Read and preprocess using OpenCV
         content = await file.read()
-        img = Image.open(io.BytesIO(content))
-        text = pytesseract.image_to_string(img)
+        processed_img = preprocess_image(content)
+
+        # Run Tesseract OCR
+        text = pytesseract.image_to_string(processed_img)
+
         extracted = extract_details(text)
 
         # Add created_at in IST
         ist = pytz.timezone("Asia/Kolkata")
         extracted["created_at"] = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
+        # Insert to MongoDB
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
-        return {
-            "message": "Inserted Successfully",
-            "data": JSONEncoder.encode(inserted)
-        }
+        return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
+
     except Exception as e:
         return {"error": str(e)}
 
-# Fetch all cards
+
 @app.get("/all_cards")
 def get_all_cards():
     try:
@@ -177,7 +201,7 @@ def get_all_cards():
     except Exception as e:
         return {"error": str(e)}
 
-# Update Notes - exact replacement
+
 @app.put("/update_notes/{card_id}")
 def update_notes(card_id: str, payload: dict = Body(...)):
     try:
