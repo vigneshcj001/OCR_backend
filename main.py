@@ -5,12 +5,11 @@ from bson import ObjectId
 import pytesseract
 import cv2
 import numpy as np
-import io
-import os
 import re
 from dotenv import load_dotenv
 from datetime import datetime
 import pytz
+import os
 
 # --------------------------
 # Load ENV
@@ -22,7 +21,6 @@ MONGO_URI = os.getenv("MONGO_URI")
 # FastAPI & MongoDB Setup
 # --------------------------
 app = FastAPI()
-
 client = MongoClient(MONGO_URI)
 db = client["business_cards"]
 collection = db["contacts"]
@@ -51,32 +49,28 @@ class JSONEncoder:
             return [JSONEncoder.encode(x) for x in doc]
         return doc
 
+
 # --------------------------
-# OCR Extraction Logic
+# Image Preprocessing
 # --------------------------
 def preprocess_image(content: bytes) -> np.ndarray:
-    """Enhanced preprocessing for better OCR on address text."""
     file_bytes = np.frombuffer(content, np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
-
-    # Convert to grayscale
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Enhance contrast
+    # Enhance contrast and clarity
     gray = cv2.equalizeHist(gray)
-
-    # Adaptive threshold (better for faint text)
     thresh = cv2.adaptiveThreshold(
         gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 10
     )
-
-    # Morph closing to connect thin text
     kernel = np.ones((2, 2), np.uint8)
     morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-
     return morph
 
 
+# --------------------------
+# Extraction Logic
+# --------------------------
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -94,26 +88,35 @@ def extract_details(text: str):
     }
 
     # EMAIL
-    email = re.search(r"[\w\.-]+@[\w\.-]+", raw_text)
-    data["email"] = email.group(0) if email else ""
+    email = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw_text)
+    data["email"] = email.group(0).lower() if email else ""
 
-    # WEBSITE — fix OCR spacing like "WWW. ceiyone. com"
+    # WEBSITE
     website_match = re.search(
         r"(?:https?://)?(?:www[\s\.]*)?[A-Za-z0-9\-]+\s*(?:\.\s*[A-Za-z]{2,})(?:\s*\.\s*[A-Za-z]{2,})?",
-        raw_text,
-        flags=re.I
+        raw_text, flags=re.I
     )
     if website_match:
         cleaned = website_match.group(0)
         cleaned = re.sub(r"\s*([\.])\s*", r"\1", cleaned)
         cleaned = re.sub(r"\s+", "", cleaned)
-        if not cleaned.lower().startswith("http"):
-            cleaned = "https://" + cleaned.lower().replace("https://https://", "https://")
-        data["website"] = cleaned
+        cleaned = cleaned.lower()
+        if not cleaned.startswith("http"):
+            cleaned = "https://" + cleaned
+        if not cleaned.startswith("https://www"):
+            cleaned = cleaned.replace("https://", "https://www.")
+        data["website"] = cleaned.replace("https://https://", "https://")
 
     # PHONE NUMBERS
     phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
-    data["phone_numbers"] = list(set(phones))
+    clean_phones = []
+    for p in phones:
+        p = re.sub(r"[^\d\+]", "", p)
+        if len(p) >= 10:
+            if not p.startswith("+"):
+                p = "+91" + p[-10:]
+            clean_phones.append(p)
+    data["phone_numbers"] = list(set(clean_phones))
 
     # SOCIAL LINKS
     for l in lines:
@@ -122,8 +125,8 @@ def extract_details(text: str):
 
     # DESIGNATION
     designation_keywords = [
-        "founder", "ceo", "cto", "coo", "manager",
-        "director", "engineer", "consultant", "head", "lead"
+        "founder", "ceo", "cto", "coo", "manager", "director",
+        "engineer", "consultant", "head", "lead", "analyst"
     ]
     for line in lines:
         if any(kw in line.lower() for kw in designation_keywords):
@@ -140,7 +143,7 @@ def extract_details(text: str):
     company_words = data["company"].lower().split() if data["company"] else []
     for l in lines:
         clean = re.sub(r"[^A-Za-z ]", "", l).strip()
-        if not clean:
+        if not clean or len(clean.split()) > 4:
             continue
         if any(w in clean.lower() for w in company_words):
             continue
@@ -148,41 +151,36 @@ def extract_details(text: str):
             continue
         if any(kw in clean.lower() for kw in designation_keywords):
             continue
-        alpha_ratio = len(re.findall(r"[A-Za-z]", clean)) / max(1, len(clean))
-        if alpha_ratio < 0.7:
-            continue
-        if clean.replace(" ", "").isupper():
+        if clean.replace(" ", "").isupper() or clean.istitle():
             data["name"] = clean
             break
 
-    # ------------------------
-    # ADDRESS (Enhanced Logic)
-    # ------------------------
+    # ADDRESS
     address_keywords = [
-        "road", "street", "st", "lane", "nagar", "layout", "block", "phase",
-        "colony", "avenue", "main", "cross", "near", "opp", "building",
-        "coimbatore", "chennai", "bangalore", "delhi", "mumbai", "pune",
-        "hyderabad", "india", "tamil", "nadu", "district", "pin", "zip"
+        "road", "street", "st", "lane", "nagar", "layout", "block",
+        "phase", "colony", "avenue", "main", "cross", "near", "opp",
+        "building", "coimbatore", "chennai", "bangalore", "delhi",
+        "mumbai", "pune", "hyderabad", "india", "tamil", "nadu",
+        "district", "pin", "zip", "code"
     ]
-
     address_candidates = []
     for l in lines:
         l_clean = l.lower()
-        # skip lines that look like names, emails, or phones
         if any(x in l_clean for x in ["@", "www", "http", "linkedin", "+91", "phone", "tel"]):
             continue
         if any(kw in l_clean for kw in address_keywords):
             address_candidates.append(l.strip())
 
-    # If address still not found, try lines near the end of the card
     if not address_candidates and len(lines) > 2:
-        possible_bottom_lines = lines[-3:]
-        for l in possible_bottom_lines:
-            if len(l.split()) > 3:  # long lines = probable address
+        for l in lines[-4:]:
+            if len(l.split()) > 3:
                 address_candidates.append(l)
 
     if address_candidates:
-        data["address"] = ", ".join(address_candidates)
+        joined = ", ".join(address_candidates)
+        joined = re.sub(r"\s{2,}", " ", joined)
+        joined = re.sub(r"\s*,\s*", ", ", joined)
+        data["address"] = joined.strip()
 
     return data
 
@@ -198,20 +196,15 @@ def root():
 @app.post("/upload_card")
 async def upload_card(file: UploadFile = File(...)):
     try:
-        # Read and preprocess using OpenCV
         content = await file.read()
         processed_img = preprocess_image(content)
-
-        # Run Tesseract OCR
         text = pytesseract.image_to_string(processed_img)
 
         extracted = extract_details(text)
 
-        # Add created_at in IST
         ist = pytz.timezone("Asia/Kolkata")
         extracted["created_at"] = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
-        # Insert to MongoDB
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
         return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
@@ -242,6 +235,3 @@ def update_notes(card_id: str, payload: dict = Body(...)):
         return {"message": "No changes made", "data": new_notes}
     except Exception as e:
         return {"error": str(e)}
-
-
-
