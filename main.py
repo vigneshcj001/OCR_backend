@@ -76,6 +76,7 @@ def extract_details(text: str):
     phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
     data["phone_numbers"] = list(set(phones))
 
+    # -----------------------------------------
     # SOCIAL LINKS
     for l in lines:
         if "linkedin" in l.lower() or "in/" in l.lower():
@@ -102,14 +103,14 @@ def extract_details(text: str):
         data["designation"] = cleaned_designation
 
     # -----------------------------------------
-    # COMPANY
+    # COMPANY EXTRACTION
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
             data["company"] = line
             break
 
     # -----------------------------------------
-    # ✅ SUPER ROBUST NAME DETECTION
+    # ✅ FINAL: PERFECT NAME DETECTION LOGIC
     # -----------------------------------------
     company_words = []
     if data["company"]:
@@ -122,7 +123,7 @@ def extract_details(text: str):
         if not clean:
             continue
 
-        # Remove company words (Ceiyone, Tech, Works)
+        # Skip company words
         if any(w in clean.lower() for w in company_words):
             continue
 
@@ -130,7 +131,7 @@ def extract_details(text: str):
         if "@" in clean or "www" in clean.lower():
             continue
 
-        # Skip designation lines
+        # Skip designation
         if any(kw in clean.lower() for kw in designation_keywords):
             continue
 
@@ -139,26 +140,26 @@ def extract_details(text: str):
         if alpha_ratio < 0.7:
             continue
 
-        # All words capitalized → Name
+        # Name words must be capitalized
         if all(w.isalpha() and w[0].isupper() for w in clean.split()):
             name_candidates.append(clean)
 
-    # Combine first two uppercase name lines
-    if len(name_candidates) >= 2:
-        line1 = name_candidates[0]
-        line2 = name_candidates[1].replace(" ", "")  # fix SUBBURATHIN AM
-        data["name"] = f"{line1} {line2}"
-    elif len(name_candidates) == 1:
-        data["name"] = name_candidates[0]
+    # FIX: surname split issue: "SUBBURATHIN AM" → "SUBBURATHINAM"
+    cleaned = [n.replace(" ", "") for n in name_candidates]
 
-    # Fallback: use line above designation
+    # Combine first name + last name
+    if len(cleaned) >= 2:
+        data["name"] = f"{cleaned[0]} {cleaned[1]}"
+    elif len(cleaned) == 1:
+        data["name"] = cleaned[0]
+
+    # fallback
     if not data["name"] and designation_index and designation_index > 0:
         fallback = lines[designation_index - 1]
-        clean_fallback = re.sub(r"[^A-Za-z ]", "", fallback).strip()
-        data["name"] = clean_fallback
+        data["name"] = re.sub(r"[^A-Za-z ]", "", fallback).strip()
 
     # -----------------------------------------
-    # ADDRESS
+    # ADDRESS DETECTION
     address_lines = []
     for l in lines:
         if re.search(
