@@ -102,9 +102,8 @@ def extract_details(text: str):
             data["company"] = line
             break
 
-    # FIRST NAME EXTRACTION
+    # NAME EXTRACTION
     company_words = data["company"].lower().split() if data["company"] else []
-
     for l in lines:
         clean = re.sub(r"[^A-Za-z ]", "", l).strip()
         if not clean:
@@ -122,7 +121,7 @@ def extract_details(text: str):
             data["name"] = clean.split()[0]
             break
 
-    # Fallback: name above designation if not found
+    # Fallback name
     if not data["name"]:
         for idx, line in enumerate(lines):
             if data["designation"] and line == data["designation"] and idx > 0:
@@ -178,16 +177,17 @@ def get_all_cards():
     except Exception as e:
         return {"error": str(e)}
 
-# Update Notes
+# Update Notes - exact replacement
 @app.put("/update_notes/{card_id}")
 def update_notes(card_id: str, payload: dict = Body(...)):
     try:
+        new_notes = payload.get("additional_notes", "")
         result = collection.update_one(
             {"_id": ObjectId(card_id)},
-            {"$set": {"additional_notes": payload.get("additional_notes", "")}}
+            {"$set": {"additional_notes": new_notes}}
         )
         if result.modified_count:
-            return {"message": "Notes updated successfully"}
-        return {"message": "No changes made"}
+            return {"message": "Notes updated successfully", "data": new_notes}
+        return {"message": "No changes made", "data": new_notes}
     except Exception as e:
         return {"error": str(e)}
