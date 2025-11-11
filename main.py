@@ -49,7 +49,6 @@ class JSONEncoder:
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
-    lower_text = raw_text.lower()
 
     data = {
         "name": "",
@@ -75,54 +74,59 @@ def extract_details(text: str):
     phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
     data["phone_numbers"] = list(set(phones))
 
-    # SOCIAL (LinkedIn IDs, etc.)
+    # SOCIAL LINKS
     for l in lines:
         if "linkedin" in l.lower() or "in/" in l.lower():
             data["social_links"].append(l)
 
-    # -------------------------------------
-    # FIX #1 → CLEAN DESIGNATION
-    # -------------------------------------
+    # ---------------------------------------------------
+    # FIXED: IDENTIFY DESIGNATION AND ORIGINAL INDEX
+    # ---------------------------------------------------
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager", "director",
         "engineer", "consultant", "head", "lead"
     ]
 
-    for line in lines:
+    designation_index = None
+    designation_line = None
+
+    for i, line in enumerate(lines):
         if any(kw in line.lower() for kw in designation_keywords):
-            # remove junk like "fm ..."
-            cleaned = re.sub(r"fm.*", "", line, flags=re.I).strip()
-            data["designation"] = cleaned
+            designation_index = i
+            designation_line = line
             break
 
+    # Clean designation (remove 'fm ...')
+    if designation_line:
+        cleaned_designation = re.sub(r"fm.*", "", designation_line, flags=re.I).strip()
+        data["designation"] = cleaned_designation
+
+    # ---------------------------------------------------
     # COMPANY
+    # ---------------------------------------------------
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
             data["company"] = line
             break
 
-    # -------------------------------------
-    # FIX #2 → BEST NAME EXTRACTION LOGIC
-    # Extract two consecutive uppercase word lines
-    # -------------------------------------
-    uppercase_lines = []
-    for line in lines:
-        if re.fullmatch(r"[A-Z ]{5,}", line.replace(" ", "")):
-            uppercase_lines.append(line)
+    # ---------------------------------------------------
+    # NAME EXTRACTION
+    # 1. Use two uppercase consecutive lines (BEST)
+    # ---------------------------------------------------
+    uppercase_lines = [l for l in lines if l.replace(" ", "").isupper()]
 
-    # If two lines are uppercase (like your card)
     if len(uppercase_lines) >= 2:
         data["name"] = " ".join(uppercase_lines[:2])
 
-    # If still empty → fallback: line before designation
-    if not data["name"] and data["designation"]:
-        idx = lines.index(data["designation"])
-        if idx > 0:
-            candidate = lines[idx - 1]
-            if "@" not in candidate and "www" not in candidate.lower():
-                data["name"] = candidate
+    # Fallback → use line above designation
+    if not data["name"] and designation_index is not None and designation_index > 0:
+        possible_name = lines[designation_index - 1]
+        if "@" not in possible_name and "www" not in possible_name.lower():
+            data["name"] = possible_name
 
+    # ---------------------------------------------------
     # ADDRESS
+    # ---------------------------------------------------
     address_lines = []
     for l in lines:
         if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|pincode|641)", l, re.I):
@@ -132,7 +136,6 @@ def extract_details(text: str):
         data["address"] = ", ".join(address_lines)
 
     return data
-
 
 
 # --------------------------
