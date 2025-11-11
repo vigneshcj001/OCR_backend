@@ -45,7 +45,8 @@ class JSONEncoder:
 
 
 # --------------------------
-# OCR Extraction Logic (Improved)
+# OCR Extraction Logic (Final Version)
+# --------------------------
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -108,38 +109,49 @@ def extract_details(text: str):
             break
 
     # -----------------------------------------
-    # ✅ FIX: EXTREMELY ROBUST NAME DETECTION
+    # ✅ SUPER ROBUST NAME DETECTION
     # -----------------------------------------
-    cleaned_name_lines = []
+    company_words = []
+    if data["company"]:
+        company_words = data["company"].lower().split()
+
+    name_candidates = []
 
     for l in lines:
-        clean = re.sub(r"[^A-Za-z ]", "", l).strip()  # remove symbols like ©
+        clean = re.sub(r"[^A-Za-z ]", "", l).strip()
         if not clean:
             continue
 
-        # Must be mostly alphabetic
-        if len(re.findall(r"[A-Za-z]", clean)) < len(clean) * 0.6:
+        # Remove company words (Ceiyone, Tech, Works)
+        if any(w in clean.lower() for w in company_words):
             continue
 
-        # Must NOT be phone/email/website
+        # Skip email/phone/website
         if "@" in clean or "www" in clean.lower():
             continue
 
-        # Avoid designation keywords
+        # Skip designation lines
         if any(kw in clean.lower() for kw in designation_keywords):
             continue
 
-        # Name is usually 1–3 words, each capitalized
+        # Must be alphabetic-heavy
+        alpha_ratio = len(re.findall(r"[A-Za-z]", clean)) / max(1, len(clean))
+        if alpha_ratio < 0.7:
+            continue
+
+        # All words capitalized → Name
         if all(w.isalpha() and w[0].isupper() for w in clean.split()):
-            cleaned_name_lines.append(clean)
+            name_candidates.append(clean)
 
-    # If we found strong candidate lines
-    if len(cleaned_name_lines) >= 2:
-        data["name"] = " ".join(cleaned_name_lines[:2])
-    elif len(cleaned_name_lines) == 1:
-        data["name"] = cleaned_name_lines[0]
+    # Combine first two uppercase name lines
+    if len(name_candidates) >= 2:
+        line1 = name_candidates[0]
+        line2 = name_candidates[1].replace(" ", "")  # fix SUBBURATHIN AM
+        data["name"] = f"{line1} {line2}"
+    elif len(name_candidates) == 1:
+        data["name"] = name_candidates[0]
 
-    # Fallback: line above designation
+    # Fallback: use line above designation
     if not data["name"] and designation_index and designation_index > 0:
         fallback = lines[designation_index - 1]
         clean_fallback = re.sub(r"[^A-Za-z ]", "", fallback).strip()
@@ -149,7 +161,11 @@ def extract_details(text: str):
     # ADDRESS
     address_lines = []
     for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)", l, re.I):
+        if re.search(
+            r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)",
+            l,
+            re.I,
+        ):
             address_lines.append(l)
 
     if address_lines:
@@ -185,5 +201,3 @@ async def upload_card(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"error": str(e)}
-
-
