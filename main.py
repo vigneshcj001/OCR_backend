@@ -1,12 +1,8 @@
-# =========================================================
-# BUSINESS CARD OCR → MONGODB FASTAPI BACKEND
-# =========================================================
-
 from fastapi import FastAPI, File, UploadFile, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from bson import ObjectId
-from PIL import Image, ImageEnhance, ImageFilter
+from PIL import Image
 import pytesseract
 import io
 import os
@@ -19,12 +15,12 @@ import pytz
 # Load Environment Variables
 # =========================================================
 load_dotenv()
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017/")
+MONGO_URI = os.getenv("MONGO_URI")
 
 # =========================================================
 # FastAPI & MongoDB Setup
 # =========================================================
-app = FastAPI(title="📇 Business Card OCR API", version="1.0")
+app = FastAPI()
 
 client = MongoClient(MONGO_URI)
 db = client["business_cards"]
@@ -57,17 +53,7 @@ class JSONEncoder:
 # =========================================================
 # OCR Extraction Logic
 # =========================================================
-def preprocess_image(img: Image.Image) -> Image.Image:
-    """Enhance image before OCR for better text extraction."""
-    img = img.convert("L")  # Convert to grayscale
-    img = img.filter(ImageFilter.SHARPEN)
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(2)  # Increase contrast
-    return img
-
-
 def extract_details(text: str):
-    """Extract key details from OCR text."""
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
 
@@ -102,9 +88,8 @@ def extract_details(text: str):
 
     # ---------------- DESIGNATION ----------------
     designation_keywords = [
-        "founder", "ceo", "cto", "coo", "manager", "director",
-        "engineer", "consultant", "head", "lead", "executive",
-        "analyst", "specialist", "administrator", "developer"
+        "founder", "ceo", "cto", "coo", "manager",
+        "director", "engineer", "consultant", "head", "lead"
     ]
     for line in lines:
         if any(kw in line.lower() for kw in designation_keywords):
@@ -113,11 +98,11 @@ def extract_details(text: str):
 
     # ---------------- COMPANY ----------------
     for line in lines:
-        if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works|technologies|solutions|systems)", line, re.I):
-            data["company"] = line.strip()
+        if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
+            data["company"] = line
             break
 
-    # ---------------- NAME EXTRACTION (Uppercase logic) ----------------
+    # ---------------- NAME EXTRACTION (Improved for multi-line uppercase names) ----------------
     company_words = data["company"].lower().split() if data["company"] else []
     uppercase_lines = []
 
@@ -137,13 +122,13 @@ def extract_details(text: str):
         if clean.replace(" ", "").isupper():
             uppercase_lines.append(clean)
 
-    # ✅ Join consecutive uppercase lines (e.g., “GANAPATHY” + “SUBBURATHINAM”)
+    # ✅ Join consecutive uppercase lines (handles “GANAPATHY” + “SUBBURATHINAM”)
     if len(uppercase_lines) >= 2:
         data["name"] = " ".join(uppercase_lines[:2])
     elif uppercase_lines:
         data["name"] = uppercase_lines[0]
 
-    # Fallback: name above designation
+    # Fallback: name above designation if not found
     if not data["name"]:
         for idx, line in enumerate(lines):
             if data["designation"] and line == data["designation"] and idx > 0:
@@ -154,7 +139,7 @@ def extract_details(text: str):
     # ---------------- ADDRESS ----------------
     address_lines = []
     for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|cross|city|coimbatore|bangalore|tamil|india|641|600)", l, re.I):
+        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)", l, re.I):
             address_lines.append(l)
     if address_lines:
         data["address"] = ", ".join(address_lines)
@@ -162,37 +147,32 @@ def extract_details(text: str):
     return data
 
 # =========================================================
-# ROUTES
+# API ROUTES
 # =========================================================
 
 @app.get("/")
 def root():
-    return {"message": "✅ Business Card OCR API Running"}
+    return {"message": "OCR Backend Running ✅"}
 
 
 # ---------------- Upload Business Card ----------------
 @app.post("/upload_card")
 async def upload_card(file: UploadFile = File(...)):
     try:
-        # Read and preprocess
         content = await file.read()
         img = Image.open(io.BytesIO(content))
-        img = preprocess_image(img)
-
-        # OCR
-        text = pytesseract.image_to_string(img, config="--psm 6")
+        text = pytesseract.image_to_string(img)
         extracted = extract_details(text)
 
-        # Timestamp (IST)
+        # Add created_at in IST
         ist = pytz.timezone("Asia/Kolkata")
         extracted["created_at"] = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
-        # Insert to MongoDB
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
 
         return {
-            "message": "✅ Card inserted successfully",
+            "message": "Inserted Successfully",
             "data": JSONEncoder.encode(inserted),
         }
 
@@ -204,7 +184,7 @@ async def upload_card(file: UploadFile = File(...)):
 @app.get("/all_cards")
 def get_all_cards():
     try:
-        docs = list(collection.find().sort("created_at", -1))
+        docs = list(collection.find())
         return {"data": JSONEncoder.encode(docs)}
     except Exception as e:
         return {"error": str(e)}
@@ -219,19 +199,8 @@ def update_notes(card_id: str, payload: dict = Body(...)):
             {"$set": {"additional_notes": payload.get("additional_notes", "")}},
         )
         if result.modified_count:
-            return {"message": "✅ Notes updated successfully"}
-        return {"message": "ℹ️ No changes made"}
+            return {"message": "Notes updated successfully"}
+        return {"message": "No changes made"}
     except Exception as e:
         return {"error": str(e)}
 
-
-# ---------------- Delete Card ----------------
-@app.delete("/delete_card/{card_id}")
-def delete_card(card_id: str):
-    try:
-        result = collection.delete_one({"_id": ObjectId(card_id)})
-        if result.deleted_count:
-            return {"message": "🗑️ Card deleted successfully"}
-        return {"message": "⚠️ Card not found"}
-    except Exception as e:
-        return {"error": str(e)}
