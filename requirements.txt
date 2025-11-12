@@ -7,3 +7,4 @@ python-multipart
 pymongo
 python-dotenv
 pytz
+opencv-python
