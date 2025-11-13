@@ -37,7 +37,7 @@ app.add_middleware(
 )
 
 # =========================================================
-# JSON Encoder for ObjectId
+# JSON Encoder
 # =========================================================
 class JSONEncoder:
     @staticmethod
@@ -69,77 +69,55 @@ def extract_details(text: str):
         "additional_notes": raw_text,
     }
 
-    # ---------------- EMAIL ----------------
+    # EMAIL
     email = re.search(r"[\w\.-]+@[\w\.-]+", raw_text)
     data["email"] = email.group(0) if email else ""
 
-    # ---------------- WEBSITE ----------------
+    # WEBSITE
     website = re.search(r"(https?://\S+|www\.\S+)", raw_text)
     data["website"] = website.group(0) if website else ""
 
-    # ---------------- PHONE NUMBERS ----------------
+    # PHONE NUMBERS
     phones = re.findall(r"\+?\d[\d \-]{8,}\d", raw_text)
     data["phone_numbers"] = list(set(phones))
 
-    # ---------------- SOCIAL LINKS ----------------
+    # SOCIAL LINKS
     for l in lines:
         if "linkedin" in l.lower() or "in/" in l.lower():
             data["social_links"].append(l)
 
-    # ---------------- DESIGNATION ----------------
+    # DESIGNATION
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager",
         "director", "engineer", "consultant", "head", "lead"
     ]
     for line in lines:
         if any(kw in line.lower() for kw in designation_keywords):
-            data["designation"] = re.sub(r"fm.*", "", line, flags=re.I).strip()
+            data["designation"] = line
             break
 
-    # ---------------- COMPANY ----------------
+    # COMPANY
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
             data["company"] = line
             break
 
-    # ---------------- NAME EXTRACTION (Improved for multi-line uppercase names) ----------------
-    company_words = data["company"].lower().split() if data["company"] else []
+    # NAME (Uppercase lines)
     uppercase_lines = []
-
     for l in lines:
         clean = re.sub(r"[^A-Za-z ]", "", l).strip()
-        if not clean:
-            continue
-        if any(w in clean.lower() for w in company_words):
-            continue
-        if "@" in clean or "www" in clean.lower():
-            continue
-        if any(kw in clean.lower() for kw in designation_keywords):
-            continue
-        alpha_ratio = len(re.findall(r"[A-Za-z]", clean)) / max(1, len(clean))
-        if alpha_ratio < 0.7:
-            continue
-        if clean.replace(" ", "").isupper():
+        if clean and clean.replace(" ", "").isupper():
             uppercase_lines.append(clean)
 
-    # Join consecutive uppercase lines (handles multi-line names)
     if len(uppercase_lines) >= 2:
         data["name"] = " ".join(uppercase_lines[:2])
     elif uppercase_lines:
         data["name"] = uppercase_lines[0]
 
-    # Fallback: name above designation if not found
-    if not data["name"]:
-        for idx, line in enumerate(lines):
-            if data["designation"] and line == data["designation"] and idx > 0:
-                fallback = re.sub(r"[^A-Za-z ]", "", lines[idx - 1]).strip()
-                data["name"] = fallback
-                break
-
-    # ---------------- ADDRESS ----------------
+    # ADDRESS
     address_lines = []
     for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|coimbatore|tamil|india|641)", l, re.I):
+        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|india|641)", l, re.I):
             address_lines.append(l)
     if address_lines:
         data["address"] = ", ".join(address_lines)
@@ -164,17 +142,14 @@ async def upload_card(file: UploadFile = File(...)):
         text = pytesseract.image_to_string(img)
         extracted = extract_details(text)
 
-        # Add created_at in IST
         ist = pytz.timezone("Asia/Kolkata")
         extracted["created_at"] = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
+        extracted["edited_at"] = ""  # not yet edited
 
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
 
-        return {
-            "message": "Inserted Successfully",
-            "data": JSONEncoder.encode(inserted),
-        }
+        return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
 
     except Exception as e:
         return {"error": str(e)}
@@ -190,63 +165,49 @@ def get_all_cards():
         return {"error": str(e)}
 
 
-# Update Notes (existing route)
+# Update Notes (kept for compatibility)
 @app.put("/update_notes/{card_id}")
 def update_notes(card_id: str, payload: dict = Body(...)):
     try:
-        result = collection.update_one(
-            {"_id": ObjectId(card_id)},
-            {"$set": {"additional_notes": payload.get("additional_notes", "")}},
-        )
-        if result.modified_count:
-            return {"message": "Notes updated successfully"}
-        return {"message": "No changes made"}
+        ist = pytz.timezone("Asia/Kolkata")
+        ts = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
+
+        update_payload = {
+            "additional_notes": payload.get("additional_notes", ""),
+            "edited_at": ts
+        }
+
+        collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_payload})
+        updated = collection.find_one({"_id": ObjectId(card_id)})
+
+        return {"message": "Updated", "data": JSONEncoder.encode(updated)}
+
     except Exception as e:
         return {"error": str(e)}
 
 
-# ----------------------------
-# New: General PATCH update route
-# ----------------------------
+# PATCH Update Route (inline edits)
 @app.patch("/update_card/{card_id}")
 def update_card(card_id: str, payload: dict = Body(...)):
-    """
-    Update allowed fields for a card. Only keys in allowed_fields are applied.
-    """
     try:
         allowed_fields = {
-            "name",
-            "designation",
-            "company",
-            "phone_numbers",
-            "email",
-            "website",
-            "address",
-            "social_links",
+            "name", "designation", "company", "phone_numbers",
+            "email", "website", "address", "social_links",
             "additional_notes"
         }
 
-        update_data = {}
-        for k, v in payload.items():
-            if k in allowed_fields:
-                update_data[k] = v
+        update_data = {k: v for k, v in payload.items() if k in allowed_fields}
 
         if not update_data:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
-                                detail="No updatable fields provided.")
+            raise HTTPException(400, "No valid fields to update.")
 
-        result = collection.update_one(
-            {"_id": ObjectId(card_id)},
-            {"$set": update_data}
-        )
+        ist = pytz.timezone("Asia/Kolkata")
+        update_data["edited_at"] = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
-        if result.matched_count == 0:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
-                                detail="Card not found.")
+        collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_data})
+        updated = collection.find_one({"_id": ObjectId(card_id)})
 
-        return {"message": "Card updated successfully", "updated_fields": list(update_data.keys())}
+        return {"message": "Updated", "data": JSONEncoder.encode(updated)}
 
-    except HTTPException as he:
-        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(500, str(e))
