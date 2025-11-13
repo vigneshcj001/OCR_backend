@@ -1,11 +1,10 @@
-opencv-python-headless
 fastapi
-uvicorn
-pytesseract
-pillow
-python-multipart
+uvicorn[standard]
+pydantic[email]
 pymongo
+Pillow
+pytesseract
 python-dotenv
 pytz
-opencv-python
-
+python-multipart
+dnspython
