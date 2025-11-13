@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, Body
+from fastapi import FastAPI, File, UploadFile, Body, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
 from bson import ObjectId
@@ -122,7 +122,7 @@ def extract_details(text: str):
         if clean.replace(" ", "").isupper():
             uppercase_lines.append(clean)
 
-    # ✅ Join consecutive uppercase lines (handles “GANAPATHY” + “SUBBURATHINAM”)
+    # Join consecutive uppercase lines (handles multi-line names)
     if len(uppercase_lines) >= 2:
         data["name"] = " ".join(uppercase_lines[:2])
     elif uppercase_lines:
@@ -155,7 +155,7 @@ def root():
     return {"message": "OCR Backend Running ✅"}
 
 
-# ---------------- Upload Business Card ----------------
+# Upload Business Card
 @app.post("/upload_card")
 async def upload_card(file: UploadFile = File(...)):
     try:
@@ -180,7 +180,7 @@ async def upload_card(file: UploadFile = File(...)):
         return {"error": str(e)}
 
 
-# ---------------- Fetch All Cards ----------------
+# Fetch All Cards
 @app.get("/all_cards")
 def get_all_cards():
     try:
@@ -190,7 +190,7 @@ def get_all_cards():
         return {"error": str(e)}
 
 
-# ---------------- Update Notes ----------------
+# Update Notes (existing route)
 @app.put("/update_notes/{card_id}")
 def update_notes(card_id: str, payload: dict = Body(...)):
     try:
@@ -202,5 +202,51 @@ def update_notes(card_id: str, payload: dict = Body(...)):
             return {"message": "Notes updated successfully"}
         return {"message": "No changes made"}
     except Exception as e:
-        return {"error": str(e)}                           
+        return {"error": str(e)}
 
+
+# ----------------------------
+# New: General PATCH update route
+# ----------------------------
+@app.patch("/update_card/{card_id}")
+def update_card(card_id: str, payload: dict = Body(...)):
+    """
+    Update allowed fields for a card. Only keys in allowed_fields are applied.
+    """
+    try:
+        allowed_fields = {
+            "name",
+            "designation",
+            "company",
+            "phone_numbers",
+            "email",
+            "website",
+            "address",
+            "social_links",
+            "additional_notes"
+        }
+
+        update_data = {}
+        for k, v in payload.items():
+            if k in allowed_fields:
+                update_data[k] = v
+
+        if not update_data:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                                detail="No updatable fields provided.")
+
+        result = collection.update_one(
+            {"_id": ObjectId(card_id)},
+            {"$set": update_data}
+        )
+
+        if result.matched_count == 0:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND,
+                                detail="Card not found.")
+
+        return {"message": "Card updated successfully", "updated_fields": list(update_data.keys())}
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
