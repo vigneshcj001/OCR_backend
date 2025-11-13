@@ -8,3 +8,14 @@ pymongo
 python-dotenv
 pytz
 opencv-python
+
+fastapi
+uvicorn
+pillow
+python-dotenv
+pymongo
+openocr-python
+torch 
+torchvision
+torchaudio
+onnxruntime
