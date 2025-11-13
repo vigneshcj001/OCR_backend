@@ -202,4 +202,5 @@ def update_notes(card_id: str, payload: dict = Body(...)):
             return {"message": "Notes updated successfully"}
         return {"message": "No changes made"}
     except Exception as e:
-        return {"error": str(e)}                             fix this 
+        return {"error": str(e)}                           
+
