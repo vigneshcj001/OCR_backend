@@ -51,7 +51,7 @@ class JSONEncoder:
         return doc
 
 # =========================================================
-# OCR Extraction Logic
+# OCR Extraction Logic (Improved)
 # =========================================================
 def extract_details(text: str):
     lines = [line.strip() for line in text.split("\n") if line.strip()]
@@ -86,23 +86,25 @@ def extract_details(text: str):
         if "linkedin" in l.lower() or "in/" in l.lower():
             data["social_links"].append(l)
 
-    # DESIGNATION
+    # DESIGNATION — clean and remove OCR noise
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager",
         "director", "engineer", "consultant", "head", "lead"
     ]
     for line in lines:
         if any(kw in line.lower() for kw in designation_keywords):
-            data["designation"] = line
+            clean_line = re.split(r"(\s+fm\s+|\s+from\s+)", line, flags=re.I)[0]
+            clean_line = re.sub(r"[^A-Za-z& ]+", "", clean_line).strip()
+            data["designation"] = clean_line
             break
 
     # COMPANY
     for line in lines:
         if re.search(r"(pvt|private|ltd|llp|inc|corporation|company|works)", line, re.I):
-            data["company"] = line
+            data["company"] = line.strip()
             break
 
-    # NAME (Uppercase lines)
+    # NAME — usually uppercase and short
     uppercase_lines = []
     for l in lines:
         clean = re.sub(r"[^A-Za-z ]", "", l).strip()
@@ -117,10 +119,16 @@ def extract_details(text: str):
     # ADDRESS
     address_lines = []
     for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|india|641)", l, re.I):
+        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|tamilnadu|india|641)", l, re.I):
             address_lines.append(l)
     if address_lines:
         data["address"] = ", ".join(address_lines)
+
+    # Final Cleanups
+    data["name"] = data["name"].strip()
+    data["designation"] = data["designation"].strip()
+    data["company"] = data["company"].strip()
+    data["address"] = data["address"].strip()
 
     return data
 
@@ -139,13 +147,17 @@ async def upload_card(file: UploadFile = File(...)):
     try:
         content = await file.read()
         img = Image.open(io.BytesIO(content))
+
+        # Run OCR
         text = pytesseract.image_to_string(img)
         extracted = extract_details(text)
 
+        # Add timestamps
         ist = pytz.timezone("Asia/Kolkata")
         extracted["created_at"] = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
-        extracted["edited_at"] = ""  # not yet edited
+        extracted["edited_at"] = ""
 
+        # Save to MongoDB
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
 
@@ -165,7 +177,7 @@ def get_all_cards():
         return {"error": str(e)}
 
 
-# Update Notes (kept for compatibility)
+# Update Notes
 @app.put("/update_notes/{card_id}")
 def update_notes(card_id: str, payload: dict = Body(...)):
     try:
