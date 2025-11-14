@@ -1,4 +1,3 @@
-# backend/main.py
 import os
 import io
 import re
@@ -222,6 +221,16 @@ async def create_card(payload: ContactCreate):
         doc["created_at"] = now_ist()
         doc["edited_at"] = ""
 
+        # If email exists, update that doc instead of creating a duplicate
+        if doc.get("email"):
+            existing = collection.find_one({"email": doc["email"]})
+            if existing:
+                # merge/overwrite fields and set edited_at
+                doc["edited_at"] = now_ist()
+                collection.update_one({"_id": existing["_id"]}, {"$set": doc})
+                updated = collection.find_one({"_id": existing["_id"]})
+                return {"message": "Updated existing contact", "data": JSONEncoder.encode(updated)}
+
         result = collection.insert_one(doc)
         inserted = collection.find_one({"_id": result.inserted_id})
         return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
@@ -267,5 +276,16 @@ def update_card(card_id: str, payload: dict = Body(...)):
         collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_data})
         updated = collection.find_one({"_id": ObjectId(card_id)})
         return {"message": "Updated", "data": JSONEncoder.encode(updated)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.delete("/delete_card/{card_id}", status_code=status.HTTP_200_OK)
+def delete_card(card_id: str):
+    try:
+        result = collection.delete_one({"_id": ObjectId(card_id)})
+        if result.deleted_count == 1:
+            return {"message": "Deleted"}
+        else:
+            raise HTTPException(status_code=404, detail="Card not found.")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
