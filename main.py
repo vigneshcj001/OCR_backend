@@ -1,4 +1,6 @@
-# backend/main.py
+# ==========================
+# backend/main.py (FULL FILE)
+# ==========================
 import os
 import io
 import re
@@ -17,7 +19,7 @@ import pytz
 
 # Load .env
 load_dotenv()
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = os.getenv("MONGO_URI")
 DB_NAME = os.getenv("DB_NAME", "business_cards")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "contacts")
 
@@ -26,19 +28,19 @@ app = FastAPI(title="Business Card OCR API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to allowed origins in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# MongoDB client
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
-# -----------------------------------------
-# JSON Encoder helper
-# -----------------------------------------
+
+# ---------------------------
+# JSON Encoder
+# ---------------------------
 class JSONEncoder:
     @staticmethod
     def encode(doc: Any):
@@ -50,9 +52,10 @@ class JSONEncoder:
             return [JSONEncoder.encode(x) for x in doc]
         return doc
 
-# -----------------------------------------
-# Pydantic models
-# -----------------------------------------
+
+# ---------------------------
+# Pydantic model
+# ---------------------------
 class ContactCreate(BaseModel):
     name: Optional[str] = ""
     designation: Optional[str] = ""
@@ -66,25 +69,31 @@ class ContactCreate(BaseModel):
 
     @validator("phone_numbers", pre=True)
     def ensure_list(cls, v):
-        if v is None:
-            return []
         if isinstance(v, str):
-            items = [x.strip() for x in v.split(",") if x.strip()]
-            return items
-        return v
+            return [x.strip() for x in v.split(",") if x.strip()]
+        return v or []
 
     @validator("social_links", pre=True)
     def ensure_social_list(cls, v):
-        if v is None:
-            return []
         if isinstance(v, str):
-            items = [x.strip() for x in v.split(",") if x.strip()]
-            return items
-        return v
+            return [x.strip() for x in v.split(",") if x.strip()]
+        return v or []
 
-# -----------------------------------------
-# Utilities: extract_details (OCR parsing)
-# -----------------------------------------
+
+# ---------------------------
+# OCR Parsing
+# ---------------------------
+def clean_designation(text: str) -> str:
+    """
+    Cleans garbage suffixes like 'fm', 'm', 'ti', 'll', 'nn'.
+    Keeps only alphabet + & + - characters.
+    """
+    cleaned = re.sub(r"[^A-Za-z&\s\-]", "", text)
+    cleaned = re.sub(r"\b(fm|m|ll|ti|nn|mt|nm)\b", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip()
+    return cleaned
+
+
 def extract_details(text: str) -> Dict[str, Any]:
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -112,108 +121,87 @@ def extract_details(text: str) -> Dict[str, Any]:
     # PHONE NUMBERS
     phones = re.findall(r"\+?\d[\d \-\(\)]{6,}\d", raw_text)
     phones = [re.sub(r"[^\d\+]", "", p) for p in phones]
-    data["phone_numbers"] = list(dict.fromkeys(phones))  # dedupe
+    data["phone_numbers"] = list(dict.fromkeys(phones))
 
     # SOCIAL LINKS
     for l in lines:
-        if "linkedin" in l.lower() or "in/" in l.lower() or "twitter" in l.lower() or "instagram" in l.lower():
+        if any(x in l.lower() for x in ["linkedin", "in/", "twitter", "instagram"]):
             data["social_links"].append(l.strip())
 
-    # -----------------------------------------
-    # IMPROVED DESIGNATION LOGIC
-    # -----------------------------------------
+    # DESIGNATION
     designation_keywords = [
-        "founder", "ceo", "cto", "coo", "manager",
-        "director", "engineer", "consultant", "head", "lead",
-        "president", "vp", "vice"
+        "founder", "ceo", "cto", "coo", "manager", "director",
+        "engineer", "consultant", "head", "lead", "president", "vp", "vice"
     ]
 
     for line in lines:
         low = line.lower()
-
         if any(kw in low for kw in designation_keywords):
-
-            # Extract first few words (designation usually small)
-            words = line.split()
-            limited = " ".join(words[:4])  # keep only first 4 words
-
-            # Clean extra chars
-            clean = re.sub(r"[^A-Za-z&\s\-]", "", limited).strip()
-
-            data["designation"] = clean
+            tmp = " ".join(line.split()[:4])
+            data["designation"] = clean_designation(tmp)
             break
 
-    # COMPANY heuristics
+    # COMPANY
     for line in lines:
-        if re.search(r"\b(pvt\b|private|ltd|llp|inc\b|corporation|company|works|solutions|technologies)\b", line, re.I):
+        if re.search(r"\b(pvt|private|ltd|llp|inc|solutions|technologies|company)\b", line, re.I):
             data["company"] = line.strip()
             break
 
-    # NAME heuristics
-    uppercase_lines = []
+    # NAME
     for l in lines:
-        clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
-        if clean and clean.replace(" ", "").isupper() and len(clean.split()) <= 4:
-            uppercase_lines.append(clean)
-    if uppercase_lines:
-        data["name"] = uppercase_lines[0]
-    else:
-        for l in lines:
-            if l == data["company"] or l == data["designation"]:
-                continue
-            if re.search(r"[\w\.-]+@[\w\.-]+", l):
-                continue
-            if re.search(r"\+?\d", l):
-                continue
-            if 1 <= len(l.split()) <= 4 and len(l) < 60:
-                data["name"] = re.sub(r"[^A-Za-z\s]", "", l).strip()
-                break
+        if l not in (data["company"], data["designation"]) and not re.search(r"@|\d", l):
+            if len(l.split()) <= 4:
+                candidate = re.sub(r"[^A-Za-z\s]", "", l).strip()
+                if candidate:
+                    data["name"] = candidate
+                    break
 
-    # ADDRESS heuristics
-    address_lines = []
-    for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|tamilnadu|india|pincode|pin|641|\bnear\b|\bopp\b)", l, re.I):
-            address_lines.append(l)
+    # ADDRESS
+    address_lines = [
+        l for l in lines if re.search(
+            r"\d.*(street|st|road|rd|nagar|lane|city|tamilnadu|india|pincode|pin|641|\bnear\b|\bopp\b)",
+            l,
+            re.I
+        )
+    ]
     if address_lines:
         data["address"] = ", ".join(address_lines)
 
-    # Trim
-    for k in ["name", "designation", "company", "address", "email", "website"]:
-        if isinstance(data.get(k), str):
-            data[k] = data[k].strip()
-
     return data
 
-# -----------------------------------------
-# Helper timestamp
-# -----------------------------------------
+
+# ---------------------------
+# Time helper
+# ---------------------------
 def now_ist() -> str:
     ist = pytz.timezone("Asia/Kolkata")
     return datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
 
-# -----------------------------------------
+
+# ---------------------------
 # Routes
-# -----------------------------------------
+# ---------------------------
 @app.get("/")
 def root():
-    return {"message": "OCR Backend Running ✅"}
+    return {"message": "OCR Backend Running"}
+
 
 @app.post("/upload_card", status_code=status.HTTP_201_CREATED)
 async def upload_card(file: UploadFile = File(...)):
     try:
-        content = await file.read()
-        img = Image.open(io.BytesIO(content))
+        img = Image.open(io.BytesIO(await file.read()))
         text = pytesseract.image_to_string(img)
         extracted = extract_details(text)
-
         extracted["created_at"] = now_ist()
         extracted["edited_at"] = ""
 
         result = collection.insert_one(extracted)
-        inserted = collection.find_one({"_id": result.inserted_id})
-        return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
+        doc = collection.find_one({"_id": result.inserted_id})
+        return {"message": "Inserted", "data": JSONEncoder.encode(doc)}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/create_card", status_code=status.HTTP_201_CREATED)
 async def create_card(payload: ContactCreate):
@@ -223,10 +211,12 @@ async def create_card(payload: ContactCreate):
         doc["edited_at"] = ""
 
         result = collection.insert_one(doc)
-        inserted = collection.find_one({"_id": result.inserted_id})
-        return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
+        doc = collection.find_one({"_id": result.inserted_id})
+        return {"message": "Inserted", "data": JSONEncoder.encode(doc)}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/all_cards")
 def get_all_cards():
@@ -236,36 +226,35 @@ def get_all_cards():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.put("/update_notes/{card_id}")
-def update_notes(card_id: str, payload: dict = Body(...)):
-    try:
-        ts = now_ist()
-        update_payload = {
-            "additional_notes": payload.get("additional_notes", ""),
-            "edited_at": ts
-        }
-        collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_payload})
-        updated = collection.find_one({"_id": ObjectId(card_id)})
-        return {"message": "Updated", "data": JSONEncoder.encode(updated)}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/update_card/{card_id}")
 def update_card(card_id: str, payload: dict = Body(...)):
     try:
-        allowed_fields = {
+        allowed = {
             "name", "designation", "company", "phone_numbers",
             "email", "website", "address", "social_links",
             "additional_notes"
         }
 
-        update_data = {k: v for k, v in payload.items() if k in allowed_fields}
+        update_data = {k: v for k, v in payload.items() if k in allowed}
         if not update_data:
-            raise HTTPException(status_code=400, detail="No valid fields to update.")
+            raise HTTPException(status_code=400, detail="No valid fields")
 
         update_data["edited_at"] = now_ist()
+
         collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_data})
-        updated = collection.find_one({"_id": ObjectId(card_id)})
-        return {"message": "Updated", "data": JSONEncoder.encode(updated)}
+        doc = collection.find_one({"_id": ObjectId(card_id)})
+
+        return {"message": "Updated", "data": JSONEncoder.encode(doc)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/delete_card/{card_id}")
+def delete_card(card_id: str):
+    try:
+        collection.delete_one({"_id": ObjectId(card_id)})
+        return {"message": "Deleted"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
