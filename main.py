@@ -109,25 +109,38 @@ def extract_details(text: str) -> Dict[str, Any]:
     website = re.search(r"(https?://\S+|www\.\S+)", raw_text)
     data["website"] = website.group(0) if website else ""
 
-    # PHONE NUMBERS (simple heuristic)
+    # PHONE NUMBERS
     phones = re.findall(r"\+?\d[\d \-\(\)]{6,}\d", raw_text)
-    phones = [re.sub(r"[^\d\+]", "", p) for p in phones]  # strip separators
-    data["phone_numbers"] = list(dict.fromkeys(phones))  # dedupe preserve order
+    phones = [re.sub(r"[^\d\+]", "", p) for p in phones]
+    data["phone_numbers"] = list(dict.fromkeys(phones))  # dedupe
 
-    # SOCIAL LINKS / LinkedIn heuristic
+    # SOCIAL LINKS
     for l in lines:
         if "linkedin" in l.lower() or "in/" in l.lower() or "twitter" in l.lower() or "instagram" in l.lower():
             data["social_links"].append(l.strip())
 
-    # DESIGNATION heuristics
+    # -----------------------------------------
+    # IMPROVED DESIGNATION LOGIC
+    # -----------------------------------------
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager",
-        "director", "engineer", "consultant", "head", "lead", "president", "vp", "vice"
+        "director", "engineer", "consultant", "head", "lead",
+        "president", "vp", "vice"
     ]
+
     for line in lines:
-        if any(kw in line.lower() for kw in designation_keywords) and len(line.split()) < 6:
-            clean_line = re.sub(r"[^A-Za-z&\s\-]", "", line).strip()
-            data["designation"] = clean_line
+        low = line.lower()
+
+        if any(kw in low for kw in designation_keywords):
+
+            # Extract first few words (designation usually small)
+            words = line.split()
+            limited = " ".join(words[:4])  # keep only first 4 words
+
+            # Clean extra chars
+            clean = re.sub(r"[^A-Za-z&\s\-]", "", limited).strip()
+
+            data["designation"] = clean
             break
 
     # COMPANY heuristics
@@ -136,17 +149,15 @@ def extract_details(text: str) -> Dict[str, Any]:
             data["company"] = line.strip()
             break
 
-    # NAME heuristics: uppercase lines or first non-contact line not captured above
+    # NAME heuristics
     uppercase_lines = []
     for l in lines:
         clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
         if clean and clean.replace(" ", "").isupper() and len(clean.split()) <= 4:
             uppercase_lines.append(clean)
     if uppercase_lines:
-        # prefer first uppercase line
         data["name"] = uppercase_lines[0]
     else:
-        # fallback: first line that's not email/phone/company/designation
         for l in lines:
             if l == data["company"] or l == data["designation"]:
                 continue
@@ -154,12 +165,11 @@ def extract_details(text: str) -> Dict[str, Any]:
                 continue
             if re.search(r"\+?\d", l):
                 continue
-            # short-ish line that looks like a name
             if 1 <= len(l.split()) <= 4 and len(l) < 60:
                 data["name"] = re.sub(r"[^A-Za-z\s]", "", l).strip()
                 break
 
-    # ADDRESS heuristics (simple)
+    # ADDRESS heuristics
     address_lines = []
     for l in lines:
         if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|tamilnadu|india|pincode|pin|641|\bnear\b|\bopp\b)", l, re.I):
@@ -167,7 +177,7 @@ def extract_details(text: str) -> Dict[str, Any]:
     if address_lines:
         data["address"] = ", ".join(address_lines)
 
-    # Final trim
+    # Trim
     for k in ["name", "designation", "company", "address", "email", "website"]:
         if isinstance(data.get(k), str):
             data[k] = data[k].strip()
