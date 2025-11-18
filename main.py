@@ -1,6 +1,16 @@
 # main.py
-# OpenAI-vision-based OCR backend + CRUD routes
-# Requires: openai, fastapi, uvicorn, python-dotenv, pymongo, pillow, numpy, opencv-python
+"""
+Business Card OCR Backend (OpenAI Vision + FastAPI)
+
+Requirements:
+  - Python 3.9+
+  - pip install fastapi uvicorn pymongo python-dotenv pillow numpy opencv-python openai
+  - Set OPENAI_API_KEY in environment or .env
+
+Notes:
+  - Uses OpenAI Responses API (modern openai v1+ client).
+  - Vision model name can be overridden via OPENAI_VISION_MODEL env var.
+"""
 
 import os
 import io
@@ -18,42 +28,45 @@ from bson import ObjectId
 from PIL import Image, ImageFilter, ImageEnhance
 from dotenv import load_dotenv
 
-# Image preprocessing libs (optional but recommended)
+# Optional preprocessing libs (recommended)
 import numpy as np
 import cv2
 
-# OpenAI client
-import openai
+# Modern OpenAI client (v1+)
+from openai import OpenAI
 
-# Load .env
+# Load .env (if present)
 load_dotenv()
+
+# --------- Configuration ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY must be set in env")
-openai.api_key = OPENAI_API_KEY
+    raise RuntimeError("OPENAI_API_KEY must be set in environment or .env")
+
+# instantiate client
+client = OpenAI(api_key=OPENAI_API_KEY)
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini-vision")
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "business_cards")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "contacts")
 PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IN")
 
-# FastAPI setup
-app = FastAPI(title="Business Card OCR API")
+# --------- FastAPI setup ----------
+app = FastAPI(title="Business Card OCR API (OpenAI Vision)")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # tighten in production
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# MongoDB client
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
+# --------- MongoDB ----------
+client_mongo = MongoClient(MONGO_URI)
+db = client_mongo[DB_NAME]
 collection = db[COLLECTION_NAME]
 
-# -----------------------------------------
-# JSON Encoder helper
-# -----------------------------------------
+# --------- Helpers ----------
 class JSONEncoder:
     @staticmethod
     def encode(doc: Any):
@@ -65,9 +78,7 @@ class JSONEncoder:
             return [JSONEncoder.encode(x) for x in doc]
         return doc
 
-# -----------------------------------------
-# Pydantic models
-# -----------------------------------------
+# --------- Pydantic model ----------
 class ContactCreate(BaseModel):
     name: Optional[str] = ""
     designation: Optional[str] = ""
@@ -103,14 +114,11 @@ class ContactCreate(BaseModel):
         v = (v or "").strip()
         if v == "":
             return ""
-        # simple regex check
         if re.match(r"^[\w\.-]+@[\w\.-]+\.\w+$", v):
             return v
         raise ValueError("email must be a valid email address or empty")
 
-# -----------------------------------------
-# Simple normalization & heuristics (no external libs)
-# -----------------------------------------
+# --------- Regex heuristics & constants ----------
 EMAIL_RE = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+", re.I)
 PHONE_RE = re.compile(r"\+?\d[\d \-\(\)xextEXT]{6,}\d")
 WEBSITE_RE = re.compile(r"(https?://)?(www\.)?([A-Za-z0-9\-]+\.[A-Za-z]{2,})(/[^\s]*)?", re.I)
@@ -130,6 +138,8 @@ COMPANY_KEYWORDS_LABELS = [
     ("Inc", ["inc", "inc."]),
     ("LLP", ["llp"]),
     ("Solutions", ["solutions"]),
+    ("Technologies", ["technologies", "tech"]),
+    ("Works", ["works"])
 ]
 
 ADDRESS_COUNTRY_KEYWORDS = {
@@ -138,65 +148,53 @@ ADDRESS_COUNTRY_KEYWORDS = {
     "UK": ["united kingdom", "england", "london", "uk"],
 }
 
-def normalize_phones(raw_phone_matches: List[str]) -> List[str]:
-    out = []
-    for p in raw_phone_matches:
-        cleaned = re.sub(r"[^\d\+xX]", "", p)
-        digits_only = re.sub(r"[^\d]", "", cleaned)
-        if len(digits_only) >= 8:
-            out.append(cleaned)
-    seen = set()
-    ret = []
-    for x in out:
-        if x not in seen:
-            seen.add(x)
-            ret.append(x)
-    return ret
-
-def extract_website_from_text(text: str) -> str:
-    m = WEBSITE_RE.search(text)
-    if not m:
-        return ""
-    # return the matched host + path if present
-    return (m.group(0) or "").strip()
-
-# -----------------------------------------
-# Preprocessing (PIL + OpenCV)
-# -----------------------------------------
-from PIL import Image
-
+# --------- Preprocessing ----------
 def preprocess_pil_image(pil_img: Image.Image, upscale: bool = True) -> Image.Image:
+    """
+    Convert to RGB, grayscale, upscale if small, denoise, adaptive threshold,
+    mild sharpening and contrast. Returns a PIL Image improved for OCR/vision.
+    """
     img = pil_img.convert("RGB")
     arr = np.array(img)
 
+    # Convert to gray
     gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
 
+    # Optional upscale to improve OCR on small images
     h, w = gray.shape
     if upscale and max(h, w) < 1200:
         scale = max(1.0, 1200.0 / max(h, w))
         gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
 
+    # Denoise (bilateral preserves edges)
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
+    # Adaptive thresholding for uneven lighting
     try:
         thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                        cv2.THRESH_BINARY, 31, 15)
     except Exception:
+        # fallback to Otsu
         _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
+    # Morphological open (remove speckles)
     kernel = np.ones((1, 1), np.uint8)
     processed = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
 
     pil_proc = Image.fromarray(processed)
+
+    # Mild sharpening and contrast increase
     pil_proc = pil_proc.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=3))
     pil_proc = ImageEnhance.Contrast(pil_proc).enhance(1.15)
+
     return pil_proc
 
-# -----------------------------------------
-# OCR via OpenAI Vision (strict JSON output)
-# -----------------------------------------
-
+# --------- OpenAI Responses wrapper ----------
 def ocr_with_openai_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
+    """
+    Call OpenAI Responses API with a base64 data URL image and parse response.
+    Returns a dict: ideally the model returns JSON with needed fields; otherwise contains 'raw_text'.
+    """
     import base64
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:image/jpeg;base64,{b64}"
@@ -210,41 +208,67 @@ def ocr_with_openai_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
     )
 
     user = f"Image: {data_url}\n\nExtract the fields requested."
-    model_name = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini-vision")
 
     try:
-        resp = openai.ChatCompletion.create(
-            model=model_name,
-            messages=[
+        resp = client.responses.create(
+            model=OPENAI_VISION_MODEL,
+            input=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": user}
+                {"role": "user", "content": user},
             ],
+            temperature=0.0,
             max_tokens=1500,
-            temperature=0.0
         )
 
+        # Preferred: use output_text if available
         assistant_text = ""
-        if resp and "choices" in resp and len(resp["choices"]) > 0:
-            assistant_text = resp["choices"][0]["message"]["content"].strip()
+        try:
+            assistant_text = getattr(resp, "output_text", "") or ""
+        except Exception:
+            assistant_text = ""
 
+        # Fallback: build text from resp.output content items
+        if not assistant_text:
+            out_texts = []
+            for out in getattr(resp, "output", []) or []:
+                for c in getattr(out, "content", []) or []:
+                    if isinstance(c, dict) and "text" in c and c["text"]:
+                        out_texts.append(c["text"])
+                    elif hasattr(c, "text") and c.text:
+                        out_texts.append(c.text)
+            assistant_text = "\n".join(out_texts).strip()
+
+        # Try to parse as JSON
         try:
             parsed = json.loads(assistant_text)
+            return parsed
         except Exception:
             m = re.search(r"\{.*\}", assistant_text, re.S)
             if m:
                 try:
                     parsed = json.loads(m.group(0))
+                    return parsed
                 except Exception:
-                    parsed = {"raw_text": assistant_text}
-            else:
-                parsed = {"raw_text": assistant_text}
-        return parsed
+                    pass
+
+        # Try to find JSON-like dicts in resp.output content
+        for out in getattr(resp, "output", []) or []:
+            for c in getattr(out, "content", []) or []:
+                if isinstance(c, dict):
+                    # if keys look like our expected set, return it
+                    keys = set(c.keys())
+                    expected = {"name", "company", "phone_numbers", "email", "website", "address", "social_links", "raw_text"}
+                    if keys & expected:
+                        return c
+
+        # last resort
+        return {"raw_text": assistant_text}
 
     except Exception:
         logging.exception("OpenAI OCR error")
         raise
 
-
+# --------- Extract + local heuristics (fallbacks) ----------
 def extract_details_via_openai(pil_image: Image.Image) -> Dict[str, Any]:
     proc = preprocess_pil_image(pil_image, upscale=True)
     buf = io.BytesIO()
@@ -273,23 +297,25 @@ def extract_details_via_openai(pil_image: Image.Image) -> Dict[str, Any]:
             data["email"] = m.group(0)
 
     if not data["website"]:
-        w = extract_website_from_text(raw)
+        w = WEBSITE_RE.search(raw)
         if w:
-            data["website"] = w
+            data["website"] = w.group(0)
 
     if not data["phone_numbers"]:
         phones = PHONE_RE.findall(raw)
-        data["phone_numbers"] = normalize_phones(phones)
+        # normalize phones minimally
+        normed = []
+        for p in phones:
+            cleaned = re.sub(r"[^\d\+xX]", "", p)
+            if len(re.sub(r"[^\d]", "", cleaned)) >= 8:
+                normed.append(cleaned)
+        data["phone_numbers"] = list(dict.fromkeys(normed))
 
-    data["phone_numbers"] = list(dict.fromkeys(data["phone_numbers"]))
     data["social_links"] = list(dict.fromkeys(data["social_links"]))
 
     return data
 
-# -----------------------------------------
-# Lightweight classify_contact (no external libs)
-# -----------------------------------------
-
+# --------- Classification helpers (regex-based; no external libs) ----------
 def _detect_social_platforms(links: List[str]) -> List[str]:
     found = set()
     for link in links or []:
@@ -298,7 +324,6 @@ def _detect_social_platforms(links: List[str]) -> List[str]:
             if any(t in low for t in tests):
                 found.add(platform)
     return sorted(found)
-
 
 def _guess_company_type(company: str) -> str:
     if not company:
@@ -310,7 +335,6 @@ def _guess_company_type(company: str) -> str:
                 return label
     return ""
 
-
 def _guess_address_country(address: str) -> str:
     if not address:
         return ""
@@ -321,6 +345,17 @@ def _guess_address_country(address: str) -> str:
                 return country
     return ""
 
+def parse_phones_simple(phone_list: List[str]) -> List[Dict[str, Any]]:
+    out = []
+    for raw in phone_list or []:
+        candidate = re.sub(r"[^\d\+xX]", "", raw)
+        valid = len(re.sub(r"[^\d]", "", candidate)) >= 8
+        out.append({
+            "raw": raw,
+            "normalized": candidate if valid else None,
+            "valid": bool(valid)
+        })
+    return out
 
 def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
     c = dict(contact)
@@ -351,15 +386,7 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
         if m:
             domain = m.group(3) or ""
 
-    phones_parsed = []
-    for raw in phones or []:
-        candidate = re.sub(r"[^\d\+xX]", "", raw)
-        valid = len(re.sub(r"[^\d]", "", candidate)) >= 8
-        phones_parsed.append({
-            "raw": raw,
-            "normalized": candidate if valid else None,
-            "valid": bool(valid)
-        })
+    phones_parsed = parse_phones_simple(phones)
 
     social_platforms = _detect_social_platforms(socials + ([website] if website else []) + ([email] if email else []))
 
@@ -391,10 +418,7 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
     c["social_links"] = socials
     return c
 
-# -----------------------------------------
-# Timestamp helper
-# -----------------------------------------
-
+# --------- Timestamp helper ----------
 def now_ist() -> str:
     try:
         import pytz
@@ -403,9 +427,7 @@ def now_ist() -> str:
     except Exception:
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-# -----------------------------------------
-# Routes
-# -----------------------------------------
+# --------- Routes ----------
 @app.get("/")
 def root():
     return {"message": "OCR Backend Running ✅"}
@@ -441,7 +463,6 @@ async def upload_card(file: UploadFile = File(...)):
         logging.exception("upload_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ------------------  The routes you asked to add ------------------
 @app.post("/create_card", status_code=status.HTTP_201_CREATED)
 async def create_card(payload: ContactCreate):
     try:
