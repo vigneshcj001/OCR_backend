@@ -1,15 +1,17 @@
 # main.py
 """
-Business Card OCR Backend (OpenAI Vision + FastAPI)
+Business Card OCR Backend (OpenAI Vision + Tesseract + Mongo persistence)
 
-Requirements:
-  - Python 3.9+
-  - pip install fastapi uvicorn pymongo python-dotenv pillow numpy opencv-python openai
-  - Set OPENAI_API_KEY in environment or .env
-
-Notes:
-  - Uses OpenAI Responses API (modern openai v1+ client).
-  - Vision model name can be overridden via OPENAI_VISION_MODEL env var.
+Endpoints:
+  GET  /ping                -> healthcheck
+  GET  /                    -> basic message
+  POST /extract             -> upload image (file field 'file') -> OCR, classify, save to Mongo, return inserted doc
+  POST /vcard               -> JSON contact -> .vcf download
+  POST /create_card         -> create contact from JSON (creates or updates by email)
+  GET  /all_cards           -> list all saved cards
+  PUT  /update_notes/{id}   -> update notes
+  PATCH /update_card/{id}   -> update card fields
+  DELETE /delete_card/{id}  -> delete card
 """
 
 import os
@@ -32,19 +34,18 @@ from dotenv import load_dotenv
 import numpy as np
 import cv2
 
-# Modern OpenAI client (v1+)
-from openai import OpenAI
+# OCR + OpenAI dependencies
+import pytesseract
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
-# Load .env (if present)
+# Load .env if present
 load_dotenv()
 
 # --------- Configuration ----------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY must be set in environment or .env")
-
-# instantiate client
-client = OpenAI(api_key=OPENAI_API_KEY)
 OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini-vision")
 
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -52,14 +53,13 @@ DB_NAME = os.getenv("DB_NAME", "business_cards")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "contacts")
 PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IN")
 
-# --------- FastAPI setup ----------
-app = FastAPI(title="Business Card OCR API (OpenAI Vision)")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # tighten in production
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+TESSERACT_PATH = os.getenv("TESSERACT_PATH")
+if TESSERACT_PATH:
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+# logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("business-card-ocr")
 
 # --------- MongoDB ----------
 client_mongo = MongoClient(MONGO_URI)
@@ -150,10 +150,6 @@ ADDRESS_COUNTRY_KEYWORDS = {
 
 # --------- Preprocessing ----------
 def preprocess_pil_image(pil_img: Image.Image, upscale: bool = True) -> Image.Image:
-    """
-    Convert to RGB, grayscale, upscale if small, denoise, adaptive threshold,
-    mild sharpening and contrast. Returns a PIL Image improved for OCR/vision.
-    """
     img = pil_img.convert("RGB")
     arr = np.array(img)
 
@@ -191,10 +187,6 @@ def preprocess_pil_image(pil_img: Image.Image, upscale: bool = True) -> Image.Im
 
 # --------- OpenAI Responses wrapper ----------
 def ocr_with_openai_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
-    """
-    Call OpenAI Responses API with a base64 data URL image and parse response.
-    Returns a dict: ideally the model returns JSON with needed fields; otherwise contains 'raw_text'.
-    """
     import base64
     b64 = base64.b64encode(image_bytes).decode("utf-8")
     data_url = f"data:image/jpeg;base64,{b64}"
@@ -209,6 +201,10 @@ def ocr_with_openai_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
 
     user = f"Image: {data_url}\n\nExtract the fields requested."
 
+    if OpenAI is None:
+        raise RuntimeError("openai package not installed")
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
     try:
         resp = client.responses.create(
             model=OPENAI_VISION_MODEL,
@@ -219,54 +215,47 @@ def ocr_with_openai_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
             temperature=0.0,
             max_tokens=1500,
         )
-
-        # Preferred: use output_text if available
-        assistant_text = ""
-        try:
-            assistant_text = getattr(resp, "output_text", "") or ""
-        except Exception:
-            assistant_text = ""
-
-        # Fallback: build text from resp.output content items
-        if not assistant_text:
-            out_texts = []
-            for out in getattr(resp, "output", []) or []:
-                for c in getattr(out, "content", []) or []:
-                    if isinstance(c, dict) and "text" in c and c["text"]:
-                        out_texts.append(c["text"])
-                    elif hasattr(c, "text") and c.text:
-                        out_texts.append(c.text)
-            assistant_text = "\n".join(out_texts).strip()
-
-        # Try to parse as JSON
-        try:
-            parsed = json.loads(assistant_text)
-            return parsed
-        except Exception:
-            m = re.search(r"\{.*\}", assistant_text, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(0))
-                    return parsed
-                except Exception:
-                    pass
-
-        # Try to find JSON-like dicts in resp.output content
-        for out in getattr(resp, "output", []) or []:
-            for c in getattr(out, "content", []) or []:
-                if isinstance(c, dict):
-                    # if keys look like our expected set, return it
-                    keys = set(c.keys())
-                    expected = {"name", "company", "phone_numbers", "email", "website", "address", "social_links", "raw_text"}
-                    if keys & expected:
-                        return c
-
-        # last resort
-        return {"raw_text": assistant_text}
-
     except Exception:
         logging.exception("OpenAI OCR error")
         raise
+
+    assistant_text = ""
+    try:
+        assistant_text = getattr(resp, "output_text", "") or ""
+    except Exception:
+        assistant_text = ""
+
+    if not assistant_text:
+        out_texts = []
+        for out in getattr(resp, "output", []) or []:
+            for c in getattr(out, "content", []) or []:
+                if isinstance(c, dict) and "text" in c and c["text"]:
+                    out_texts.append(c["text"])
+                elif hasattr(c, "text") and c.text:
+                    out_texts.append(c.text)
+        assistant_text = "\n".join(out_texts).strip()
+
+    try:
+        parsed = json.loads(assistant_text)
+        return parsed
+    except Exception:
+        m = re.search(r"\{.*\}", assistant_text, re.S)
+        if m:
+            try:
+                parsed = json.loads(m.group(0))
+                return parsed
+            except Exception:
+                pass
+
+    for out in getattr(resp, "output", []) or []:
+        for c in getattr(out, "content", []) or []:
+            if isinstance(c, dict):
+                keys = set(c.keys())
+                expected = {"name", "company", "phone_numbers", "email", "website", "address", "social_links", "raw_text"}
+                if keys & expected:
+                    return c
+
+    return {"raw_text": assistant_text}
 
 # --------- Extract + local heuristics (fallbacks) ----------
 def extract_details_via_openai(pil_image: Image.Image) -> Dict[str, Any]:
@@ -303,7 +292,6 @@ def extract_details_via_openai(pil_image: Image.Image) -> Dict[str, Any]:
 
     if not data["phone_numbers"]:
         phones = PHONE_RE.findall(raw)
-        # normalize phones minimally
         normed = []
         for p in phones:
             cleaned = re.sub(r"[^\d\+xX]", "", p)
@@ -315,7 +303,7 @@ def extract_details_via_openai(pil_image: Image.Image) -> Dict[str, Any]:
 
     return data
 
-# --------- Classification helpers (regex-based; no external libs) ----------
+# --------- Classification helpers ----------
 def _detect_social_platforms(links: List[str]) -> List[str]:
     found = set()
     for link in links or []:
@@ -427,40 +415,119 @@ def now_ist() -> str:
     except Exception:
         return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
-# --------- Routes ----------
+# --------- OCR fallback (Tesseract) ----------
+def extract_with_tesseract(pil_image: Image.Image) -> Dict[str, Any]:
+    proc = preprocess_pil_image(pil_image, upscale=True)
+    buf = io.BytesIO()
+    proc.save(buf, format="JPEG", quality=90)
+    img_bytes = buf.getvalue()
+
+    try:
+        txt = pytesseract.image_to_string(Image.open(io.BytesIO(img_bytes)))
+    except Exception:
+        raise
+
+    raw = re.sub(r"\r", "\n", txt).strip()
+    parsed = {"raw_text": raw}
+    em = EMAIL_RE.search(raw)
+    if em:
+        parsed["email"] = em.group(0)
+    wp = WEBSITE_RE.search(raw)
+    if wp:
+        parsed["website"] = wp.group(0)
+    phones = PHONE_RE.findall(raw)
+    parsed["phone_numbers"] = phones
+    return parsed
+
+# --------- Extract details (OpenAI preferred, fallback to Tesseract) ----------
+def extract_details(pil_image: Image.Image) -> Dict[str, Any]:
+    if OPENAI_API_KEY and OpenAI is not None:
+        try:
+            return extract_details_via_openai(pil_image)
+        except Exception:
+            logging.exception("OpenAI vision extraction failed, falling back to Tesseract")
+            base = extract_with_tesseract(pil_image)
+            return {
+                "name": "",
+                "designation": "",
+                "company": "",
+                "phone_numbers": base.get("phone_numbers", []),
+                "email": base.get("email", ""),
+                "website": base.get("website", ""),
+                "address": "",
+                "social_links": [],
+                "more_details": "",
+                "additional_notes": base.get("raw_text", "")
+            }
+    else:
+        base = extract_with_tesseract(pil_image)
+        return {
+            "name": "",
+            "designation": "",
+            "company": "",
+            "phone_numbers": base.get("phone_numbers", []),
+            "email": base.get("email", ""),
+            "website": base.get("website", ""),
+            "address": "",
+            "social_links": [],
+            "more_details": "",
+            "additional_notes": base.get("raw_text", "")
+        }
+
+# --------- FastAPI routes ----------
+app = FastAPI(title="Business Card OCR API (OpenAI Vision + Mongo)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ----- Routes -----
 @app.get("/")
 def root():
     return {"message": "OCR Backend Running ✅"}
 
-@app.post("/upload_card", status_code=status.HTTP_201_CREATED)
-async def upload_card(file: UploadFile = File(...)):
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
+# Replaced: /extract now performs upload_card job (OCR + classify + save to Mongo)
+@app.post("/extract", status_code=status.HTTP_201_CREATED)
+async def extract_card(file: UploadFile = File(...)):
     try:
         content = await file.read()
         img = Image.open(io.BytesIO(content))
 
+        # Run OCR + parsing (OpenAI → fallback Tesseract → fallback heuristics)
         try:
-            extracted = extract_details_via_openai(img)
+            extracted = extract_details(img)
         except Exception as e:
-            logging.exception("ocr-with-openai failed")
-            raise HTTPException(status_code=500, detail=f"OCR with OpenAI failed: {e}")
+            logging.exception("OCR failed")
+            raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
 
+        # Add raw OCR data stats
         extracted["_raw_ocr_text"] = extracted.get("additional_notes", "")
         extracted["_ocr_avg_confidence"] = None
         extracted["_ocr_word_count"] = len(extracted["_raw_ocr_text"].split())
 
+        # Classify & enrich
         extracted = classify_contact(extracted)
 
         extracted["more_details"] = ""
         extracted["created_at"] = now_ist()
         extracted["edited_at"] = ""
 
+        # Insert in Mongo
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
+
         return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
+
     except HTTPException:
         raise
     except Exception as e:
-        logging.exception("upload_card error")
+        logging.exception("extract_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/create_card", status_code=status.HTTP_201_CREATED)
@@ -536,7 +603,6 @@ def update_card(card_id: str, payload: dict = Body(...)):
         if not update_data:
             raise HTTPException(status_code=400, detail="No valid fields to update.")
 
-        # fetch existing doc
         existing = collection.find_one({"_id": ObjectId(card_id)})
         if not existing:
             raise HTTPException(status_code=404, detail="Card not found.")
@@ -546,16 +612,13 @@ def update_card(card_id: str, payload: dict = Body(...)):
         merged = dict(existing)
         merged.update(update_data)
 
-        # classify -> returns normalized phone/socials and adds field_validations
         merged = classify_contact(merged)
 
-        # ensure more_details: if user provided it in update_data, keep that; otherwise preserve existing
         if "more_details" in update_data:
             merged["more_details"] = update_data.get("more_details", "")
         else:
             merged["more_details"] = existing_more
 
-        # pick only allowed fields + classification fields to set
         set_payload = {k: merged.get(k) for k in list(allowed_fields) + ["field_validations"]}
         set_payload["edited_at"] = now_ist()
 
