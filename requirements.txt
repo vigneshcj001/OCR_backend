@@ -15,4 +15,4 @@ python-multipart
 numpy
 opencv-python-headless
 openai  
-base64
+
