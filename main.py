@@ -1,11 +1,11 @@
-# File: main.py (FastAPI backend)
+# main.py (FastAPI backend with optional OpenAI refinement)
 import os
 import io
 import re
+import json
 import logging
 from datetime import datetime
-from typing import List, Optional, Any, Dict
-from difflib import SequenceMatcher
+from typing import List, Optional, Any, Dict, Tuple
 
 from fastapi import FastAPI, File, UploadFile, Body, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,8 +21,7 @@ import pytz
 # --- Additional libs for classification/validation / preprocessing ---
 import numpy as np
 import cv2
-
-# --- Additional libs for classification/validation ---
+import requests as _requests  # used for OpenAI REST call
 import phonenumbers
 import tldextract
 import validators
@@ -41,11 +40,16 @@ DB_NAME = os.getenv("DB_NAME", "business_cards")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "contacts")
 PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IN")  # default phone region
 
+# OpenAI config (env)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # change to model you have access to
+OPENAI_CONFIDENCE_THRESHOLD = float(os.getenv("OPENAI_CONFIDENCE_THRESHOLD", "80"))  # call OpenAI if avg_conf < threshold
+
 # Optional: explicitly set tesseract binary if not on PATH
 # pytesseract.pytesseract.tesseract_cmd = r"/usr/bin/tesseract"  # adjust path if necessary
 
 # FastAPI setup
-app = FastAPI(title="Business Card OCR API")
+app = FastAPI(title="Business Card OCR API (with optional OpenAI refinement)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -165,12 +169,14 @@ def preprocess_pil_image(pil_img: Image.Image, upscale: bool = True) -> Image.Im
 
 def extract_details(text: str) -> Dict[str, Any]:
     """
-    Enhanced OCR parsing with improved field extraction logic.
-    Uses multi-pass strategies and confidence scoring for better accuracy.
+    OCR parsing with improved logic to avoid picking company as name.
+    Prioritizes ALL-CAPS prominent lines near the top as person names and,
+    if company and name collide, searches for alternatives anywhere in the card.
+    (This is your pre-existing heuristic — kept mostly unchanged.)
     """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
-    
+
     data = {
         "name": "",
         "designation": "",
@@ -183,219 +189,259 @@ def extract_details(text: str) -> Dict[str, Any]:
         "more_details": "",
         "additional_notes": raw_text,
     }
-    
-    # ====== HELPER PATTERNS & KEYWORDS ======
+
+    # Helper tokens
     company_keywords = [
-        "pvt", "private", "ltd", "llp", "inc", "solutions", "technologies", "tech",
-        "corporation", "company", "corp", "industries", "works", "enterprises",
-        "consulting", "services", "group", "international", "systems"
+        "pvt", "private", "ltd", "llp", "inc", "solutions",
+        "technologies", "tech", "corporation", "company", "corp", "industries", "works", "enterprises"
     ]
-    
-    designation_keywords = [
-        "founder", "co-founder", "ceo", "cto", "coo", "cfo", "manager", "director",
-        "engineer", "consultant", "head", "lead", "president", "vp", "vice president",
-        "principal", "officer", "specialist", "executive", "developer", "designer",
-        "architect", "analyst", "coordinator", "supervisor", "administrator"
-    ]
-    
     address_tokens = [
-        "street", "st", "road", "rd", "avenue", "ave", "nagar", "lane", "city",
-        "state", "pin", "pincode", "zip", "near", "opp", "opposite", "building",
-        "bldg", "floor", "suite", "ste", "apartment", "apt", "block", "sector"
+        "street", "st", "road", "rd", "nagar", "lane", "city", "tamilnadu", "india", "pincode",
+        "pin", "near", "opp", "zip", "avenue", "av", "bldg", "building", "suite", "ste", "floor",
+        "coimbatore", "peelamedu"
     ]
-    
-    # ====== 1. EMAIL EXTRACTION (Enhanced) ======
-    email_patterns = [
-        r"[\w\.\-\+]+@[\w\.\-]+\.[a-zA-Z]{2,}",
-        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b"
+
+    # EMAIL
+    email_m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw_text)
+    data["email"] = email_m.group(0) if email_m else ""
+
+    # WEBSITE (slightly improved pattern)
+    website_m = re.search(
+        r"\b(?:https?://|www\.)[^\s,;)\]]+|\b([A-Za-z0-9\-]+\.(?:com|in|net|org|co|io|biz|info|xyz|me))\b",
+        raw_text,
+        re.I,
+    )
+    data["website"] = website_m.group(0) if website_m else ""
+
+    # PHONES (exclude very short)
+    phones = re.findall(r"\+?\d[\d \-\(\)xextEXT]{6,}\d", raw_text)
+    normed = []
+    for p in phones:
+        cleaned = re.sub(r"[^\d\+]", "", p)
+        digits_only = re.sub(r"[^\d]", "", cleaned)
+        if len(digits_only) >= 8:
+            normed.append(cleaned)
+    data["phone_numbers"] = list(dict.fromkeys(normed))
+
+    # SOCIAL LINKS / HANDLES
+    for l in lines:
+        low = l.lower()
+        if any(s in low for s in ["linkedin", "instagram", "facebook", "twitter", "x.com", "t.me", "wa.me", "telegram"]):
+            data["social_links"].append(l.strip())
+        else:
+            if re.search(r"[a-z0-9_\-]+-[a-z0-9_\-]+", low) and "@" not in low:
+                data["social_links"].append(l.strip())
+
+    # DESIGNATION
+    designation_keywords = [
+        "founder", "ceo", "cto", "coo", "manager",
+        "director", "engineer", "consultant", "head", "lead",
+        "president", "vp", "vice", "principal", "officer"
     ]
-    emails = []
-    for pattern in email_patterns:
-        emails.extend(re.findall(pattern, raw_text, re.I))
-    data["email"] = emails[0] if emails else ""
-    
-    # ====== 2. PHONE EXTRACTION (Enhanced) ======
-    phone_patterns = [
-        r"\+\d{1,3}[\s\-]?\d{3,4}[\s\-]?\d{3,4}[\s\-]?\d{3,4}",  # International
-        r"\d{3}[\s\-]\d{3}[\s\-]\d{4}",  # US format
-        r"\(\d{3}\)[\s\-]?\d{3}[\s\-]?\d{4}",  # (123) 456-7890
-        r"\d{5}[\s\-]\d{5}",  # Indian format
-        r"\d{10,}",  # 10+ digits
-    ]
-    phones = set()
-    for pattern in phone_patterns:
-        matches = re.findall(pattern, raw_text)
-        for match in matches:
-            cleaned = re.sub(r"[^\d\+]", "", match)
-            digits_only = re.sub(r"[^\d]", "", cleaned)
-            if 8 <= len(digits_only) <= 15:  # Valid phone length
-                phones.add(cleaned)
-    data["phone_numbers"] = list(phones)
-    
-    # ====== 3. WEBSITE EXTRACTION (Enhanced) ======
-    website_patterns = [
-        r"https?://[\w\.\-]+\.[\w]{2,}(?:/[\w\.\-]*)*",
-        r"www\.[\w\.\-]+\.[\w]{2,}",
-        r"\b[\w\-]+\.(?:com|in|net|org|co|io|biz|info|xyz|me|ai|tech|dev)\b"
-    ]
-    websites = []
-    for pattern in website_patterns:
-        websites.extend(re.findall(pattern, raw_text, re.I))
-    if websites:
-        # Prefer full URLs, fallback to domain
-        full_urls = [w for w in websites if w.startswith(("http", "www"))]
-        data["website"] = full_urls[0] if full_urls else websites[0]
-    
-    # ====== 4. SOCIAL LINKS (Enhanced) ======
-    social_patterns = {
-        "linkedin": r"(?:linkedin\.com/in/|linkedin\.com/company/)[\w\-]+",
-        "twitter": r"(?:twitter\.com/|x\.com/)[\w\-]+",
-        "instagram": r"instagram\.com/[\w\-\.]+",
-        "facebook": r"facebook\.com/[\w\-\.]+",
-        "github": r"github\.com/[\w\-]+",
-    }
-    
-    for platform, pattern in social_patterns.items():
-        matches = re.findall(pattern, raw_text, re.I)
-        data["social_links"].extend(matches)
-    
-    # Check for handle patterns (@ mentions)
-    handle_matches = re.findall(r"@[\w\-]+", raw_text)
-    data["social_links"].extend(handle_matches)
-    
-    # ====== 5. DESIGNATION EXTRACTION (Multi-strategy) ======
-    designation_found = False
-    
-    # Strategy 1: Lines containing designation keywords
     for line in lines:
         low = line.lower()
         if any(kw in low for kw in designation_keywords):
-            # Clean and extract
-            cleaned = re.sub(r"[^\w\s\-&/]", " ", line).strip()
-            words = cleaned.split()
-            if 1 <= len(words) <= 8:
-                data["designation"] = " ".join(words)
-                designation_found = True
-                break
-    
-    # Strategy 2: Second or third line if capitalized (common card layout)
-    if not designation_found and len(lines) >= 2:
-        for idx in [1, 2]:
-            if idx < len(lines):
-                line = lines[idx]
-                # Skip if looks like email/phone/website
-                if "@" in line or re.search(r"\d{3}", line) or ".com" in line.lower():
-                    continue
-                cleaned = re.sub(r"[^\w\s\-&/]", " ", line).strip()
-                words = cleaned.split()
-                if 1 <= len(words) <= 6:
-                    data["designation"] = " ".join(words)
-                    designation_found = True
-                    break
-    
-    # ====== 6. COMPANY EXTRACTION (Multi-strategy) ======
+            words = line.split()
+            limited = " ".join(words[:6])
+            clean = re.sub(r"[^A-Za-z&\s\-\./]", " ", limited).strip()
+            clean = re.sub(r"\b(?:fm|fin|fmr)\b", "", clean, flags=re.I).strip()
+            tokens = [t for t in clean.split() if not re.search(r"-", t)]
+            data["designation"] = re.sub(r"\s{2,}", " ", " ".join(tokens)).strip()
+            break
+
+    # COMPANY detection
     company_candidates = []
-    
-    # Strategy 1: Lines with company keywords
     for idx, line in enumerate(lines):
-        low = line.lower()
-        if any(kw in low for kw in company_keywords):
-            if not re.search(r"@", line) and not re.search(r"\d{3,}", line):
-                score = sum(1 for kw in company_keywords if kw in low)
-                company_candidates.append((score, idx, line.strip()))
-    
-    # Strategy 2: Lines with 2-5 capitalized words (brand names)
-    if not company_candidates:
-        for idx, line in enumerate(lines[:6]):  # Check top 6 lines
-            if "@" in line or re.search(r"\+?\d{3}", line):
-                continue
-            words = re.findall(r"\b[A-Z][a-z]+\b", line)
-            if 2 <= len(words) <= 5:
-                company_candidates.append((1, idx, line.strip()))
-    
-    if company_candidates:
-        # Sort by score (higher = more likely company)
-        company_candidates.sort(key=lambda x: (-x[0], x[1]))
-        data["company"] = company_candidates[0][2]
-    
-    # ====== 7. NAME EXTRACTION (Enhanced Logic) ======
-    name_candidates = []
-    
-    # Strategy 1: First line if ALL CAPS (2-4 words)
-    if lines:
-        first = lines[0]
-        cleaned = re.sub(r"[^\w\s]", "", first).strip()
-        words = cleaned.split()
-        if 2 <= len(words) <= 4 and cleaned.replace(" ", "").isupper():
-            name_candidates.append((5, cleaned.title()))
-    
-    # Strategy 2: Lines with Title Case pattern
-    for idx, line in enumerate(lines[:4]):
-        if "@" in line or re.search(r"\d{3}", line):
+        low = line.lower().strip()
+        if re.search(r"[\w\.-]+@[\w\.-]+", line) or re.search(r"\+?\d", line):
             continue
-        # Check if words start with capital
-        words = re.findall(r"\b[A-Z][a-z]+\b", line)
-        if 2 <= len(words) <= 4:
-            full_name = " ".join(words)
-            # Avoid if it's the company or designation
-            if full_name != data.get("company") and full_name != data.get("designation"):
-                name_candidates.append((3, full_name))
-    
-    # Strategy 3: SpaCy PERSON entities (if available)
-    if nlp:
+        if any(tok in low for tok in address_tokens):
+            continue
+        if any(kw in low for kw in company_keywords):
+            company_candidates.append((idx, line.strip()))
+    if not company_candidates:
+        for idx, line in enumerate(lines):
+            low = line.lower().strip()
+            if re.search(r"[\w\.-]+@[\w\.-]+", line) or re.search(r"\+?\d", line):
+                continue
+            if any(tok in low for tok in address_tokens):
+                continue
+            clean_alpha = re.sub(r"[^A-Za-z\s&\.\-]", "", line).strip()
+            if not clean_alpha:
+                continue
+            if 2 <= len(clean_alpha.split()) <= 6 and len(clean_alpha) <= 100:
+                if not (clean_alpha.replace(" ", "").isupper() and len(clean_alpha.split()) <= 4):
+                    company_candidates.append((idx, clean_alpha))
+                    break
+    if company_candidates:
+        company_candidates.sort(key=lambda t: 0 if any(k in t[1].lower() for k in ["private", "pvt", "ltd", "llp", "inc"]) else 1)
+        data["company"] = company_candidates[0][1].strip()
+        company_idx = company_candidates[0][0]
+    else:
+        data["company"] = ""
+        company_idx = None
+
+    # NAME detection with strong preference rules
+    top_region = lines[:6] if len(lines) >= 6 else lines
+
+    def is_person_like(l):
+        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+        if not cleaned:
+            return False
+        words = cleaned.split()
+        return 1 <= len(words) <= 4 and len(cleaned) <= 60
+
+    def is_all_caps_word(l):
+        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+        if not cleaned:
+            return False
+        words = cleaned.split()
+        if len(words) > 2:
+            return False
+        return all(w.isupper() and 2 <= len(w) <= 20 for w in words)
+
+    def similar(a, b):
+        return SequenceMatcher(None, (a or "").lower(), (b or "").lower()).ratio()
+
+    name_candidate = ""
+
+    # 1) ALL-CAPS lines in top region that are not company/address/phone/email
+    for idx, l in enumerate(top_region):
+        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+        if cleaned and cleaned.replace(" ", "").isupper() and 1 < len(cleaned.split()) <= 4:
+            low = l.lower()
+            if not any(kw in low for kw in company_keywords) and not any(tok in low for tok in address_tokens) and "@" not in low and not re.search(r"\+?\d", l):
+                name_candidate = cleaned.title()
+                break
+
+    # 2) Title-case / capitalized line in top region
+    if not name_candidate:
+        for idx, l in enumerate(top_region):
+            if not is_person_like(l):
+                continue
+            low = l.lower()
+            if any(kw in low for kw in company_keywords) or any(tok in low for tok in address_tokens) or "@" in low or re.search(r"\+?\d", l):
+                continue
+            words = re.sub(r"[^A-Za-z\s]", "", l).strip().split()
+            capitalized = sum(1 for w in words if w[:1].isupper())
+            if capitalized >= 1:
+                name_candidate = " ".join([w.capitalize() for w in words])
+                break
+
+    # 3) spaCy PERSON (if available)
+    if not name_candidate and nlp:
         try:
-            doc = nlp(raw_text)
+            doc = nlp(" ".join(lines))
             persons = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
-            for person in persons[:3]:  # Top 3 person entities
-                words = person.split()
-                if 2 <= len(words) <= 4:
-                    name_candidates.append((4, person))
-        except:
+            if persons:
+                for p in persons:
+                    p_clean = p.strip()
+                    if p_clean and len(p_clean.split()) <= 4:
+                        name_candidate = p_clean
+                        break
+        except Exception:
             pass
-    
-    if name_candidates:
-        # Sort by score and pick best
-        name_candidates.sort(key=lambda x: -x[0])
-        data["name"] = name_candidates[0][1]
-    
-    # ====== 8. ADDRESS EXTRACTION (Enhanced) ======
+
+    # 4) Conservative scan for any person-like line (fallback)
+    if not name_candidate:
+        for idx, l in enumerate(lines):
+            if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
+                continue
+            low = l.lower()
+            if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
+                continue
+            cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+            if cleaned and 1 <= len(cleaned.split()) <= 4:
+                name_candidate = " ".join([w.capitalize() for w in cleaned.split()])
+                break
+
+    # Additional fallbacks...
+    if not name_candidate:
+        uppercase_lines = []
+        for l in lines:
+            clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
+            if clean and clean.replace(" ", "").isupper() and len(clean.split()) <= 4:
+                uppercase_lines.append(clean)
+        if uppercase_lines:
+            name_candidate = uppercase_lines[0].title()
+        else:
+            for l in lines:
+                if l == data.get("company") or l == data.get("designation"):
+                    continue
+                if re.search(r"[\w\.-]+@[\w\.-]+", l):
+                    continue
+                if re.search(r"\+?\d", l):
+                    continue
+                if 1 <= len(l.split()) <= 4 and len(l) < 60:
+                    candidate_clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
+                    if candidate_clean:
+                        name_candidate = " ".join([w.capitalize() for w in candidate_clean.split()])
+                        break
+
+    # If candidate looks like the company, attempt alternatives
+    if name_candidate:
+        comp = (data.get("company") or "").strip()
+        low_name = name_candidate.lower()
+        low_comp = comp.lower()
+        looks_like_company = any(kw in low_name for kw in company_keywords) or (low_comp and (low_comp in low_name or low_name in low_comp)) or (comp and similar(low_name, low_comp) > 0.6)
+        if looks_like_company:
+            alt_candidate = ""
+            search_limit = company_idx if company_idx is not None else min(len(lines), 6)
+            for i in range(0, search_limit):
+                l = lines[i]
+                if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
+                    continue
+                low = l.lower()
+                if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
+                    continue
+                if is_person_like(l):
+                    cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+                    if cleaned and cleaned.replace(" ", "").isupper():
+                        alt_candidate = cleaned.title()
+                        break
+                    words = cleaned.split()
+                    capitalized = sum(1 for w in words if w[:1].isupper())
+                    if capitalized >= 1:
+                        alt_candidate = " ".join([w.capitalize() for w in words])
+                        break
+            if not alt_candidate:
+                for i, l in enumerate(lines):
+                    if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
+                        continue
+                    low = l.lower()
+                    if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
+                        continue
+                    if is_all_caps_word(l):
+                        candidate_upper = re.sub(r"[^A-Za-z\s]", "", l).strip()
+                        if comp and similar(candidate_upper, comp) > 0.7:
+                            continue
+                        alt_candidate = candidate_upper.title()
+                        break
+            if alt_candidate:
+                name_candidate = alt_candidate
+            else:
+                name_candidate = re.sub(r"\b(private|pvt|ltd|llp|inc|technologies|tech|works|solutions)\b", "", name_candidate, flags=re.I).strip()
+
+    data["name"] = (name_candidate or "").strip()
+
+    # ADDRESS extraction
     address_lines = []
-    
-    for line in lines:
-        low = line.lower()
-        # Check for address indicators
-        has_pincode = bool(re.search(r"\b\d{5,6}\b", line))
-        has_address_token = any(tok in low for tok in address_tokens)
-        has_location = bool(re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,\s*[A-Z]{2,}\b", line))
-        
-        if has_pincode or has_address_token or has_location:
-            address_lines.append(line)
-    
+    for l in lines:
+        if re.search(r"\b\d{6}\b", l) or re.search(r"\b(?:street|st|road|rd|nagar|lane|peelamedu|city|tamil nadu|coimbatore|near|opp)\b", l, re.I):
+            address_lines.append(l)
     if address_lines:
         data["address"] = ", ".join(address_lines)
-    
-    # ====== 9. CLEANUP & VALIDATION ======
-    # Remove leading/trailing special chars
-    for field in ["name", "designation", "company", "address"]:
-        if data[field]:
-            data[field] = re.sub(r"^[\W_]+|[\W_]+$", "", data[field]).strip()
-    
-    # Ensure name is not same as company
-    if data["name"] and data["company"]:
-        if SequenceMatcher(None, data["name"].lower(), data["company"].lower()).ratio() > 0.7:
-            # Try to find alternative name
-            for line in lines[:4]:
-                cleaned = re.sub(r"[^\w\s]", "", line).strip()
-                words = cleaned.split()
-                if 2 <= len(words) <= 4 and cleaned != data["company"]:
-                    data["name"] = " ".join([w.capitalize() for w in words])
-                    break
-    
-    # Deduplicate lists
-    data["phone_numbers"] = list(dict.fromkeys(data["phone_numbers"]))
-    data["social_links"] = list(dict.fromkeys(data["social_links"]))
-    
+
+    # Trim & cleanup
+    for k in ["name", "designation", "company", "address", "email", "website", "more_details"]:
+        if isinstance(data.get(k), str):
+            data[k] = data[k].strip()
+
+    data["name"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("name", ""))
+    data["company"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("company", ""))
+
     return data
+
 # -----------------------------------------
 # Timestamp helper
 # -----------------------------------------
@@ -590,6 +636,93 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
     return c
 
 # -----------------------------------------
+# OpenAI refinement helper
+# -----------------------------------------
+def call_openai_refine(raw_text: str, extracted: dict, low_conf_words: list = None, model: str = None, timeout: int = 30) -> Tuple[Optional[dict], Optional[str]]:
+    """
+    Ask OpenAI to refine/clean OCR output. Returns (parsed_dict, error_str).
+    Returns None, error_str on failure. parsed_dict contains the 10 expected keys.
+    """
+    model = model or OPENAI_MODEL
+    if not OPENAI_API_KEY:
+        return None, "OPENAI_API_KEY not configured"
+
+    low_conf_words = low_conf_words or []
+
+    system_msg = (
+        "You are a reliable data-extraction assistant. "
+        "Given raw OCR text and a best-effort parsed object, return a single JSON object "
+        "with EXACT keys: name, designation, company, phone_numbers, email, website, address, social_links, more_details, additional_notes. "
+        "Rules: phone_numbers and social_links must be arrays of strings (empty list if none). "
+        "All other fields must be strings (empty string if none). "
+        "Do NOT add any other keys. Be conservative: if uncertain, return empty string/list rather than inventing values."
+    )
+    user_msg = (
+        "Raw OCR text:\n"
+        f"{raw_text}\n\n"
+        "Low-confidence words (list):\n"
+        f"{json.dumps(low_conf_words)}\n\n"
+        "Current parsed fields (best-effort):\n"
+        f"{json.dumps(extracted, indent=2)}\n\n"
+        "Return ONLY the JSON object (no explanation)."
+    )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        "temperature": 0.0,
+        "max_tokens": 700,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        r = _requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=timeout)
+        r.raise_for_status()
+        j = r.json()
+        assistant_text = ""
+        if "choices" in j and len(j["choices"]) > 0:
+            assistant_text = j["choices"][0].get("message", {}).get("content", "") or j["choices"][0].get("text", "")
+
+        # Try to load JSON; robust extraction if surrounds text
+        try:
+            parsed = json.loads(assistant_text)
+        except Exception:
+            m = re.search(r"(\{.*\})", assistant_text, re.S)
+            if m:
+                try:
+                    parsed = json.loads(m.group(1))
+                except Exception as e:
+                    return None, f"Failed to parse JSON from assistant: {e}"
+            else:
+                return None, "No JSON found in assistant response"
+
+        # Normalize types
+        for key in ["phone_numbers", "social_links"]:
+            if key not in parsed or parsed[key] is None:
+                parsed[key] = []
+            elif isinstance(parsed[key], str):
+                parsed[key] = [s.strip() for s in parsed[key].split(",") if s.strip()]
+            elif not isinstance(parsed[key], list):
+                parsed[key] = list(parsed.get(key)) if parsed.get(key) else []
+
+        for key in ["name", "designation", "company", "email", "website", "address", "more_details", "additional_notes"]:
+            if key not in parsed or parsed[key] is None:
+                parsed[key] = ""
+            else:
+                parsed[key] = str(parsed[key]).strip()
+
+        return parsed, None
+    except Exception as e:
+        return None, str(e)
+
+# -----------------------------------------
 # Routes
 # -----------------------------------------
 @app.get("/")
@@ -653,11 +786,37 @@ async def upload_card(file: UploadFile = File(...)):
             # non-fatal: don't block processing if this debug step fails
             extracted["_ocr_low_conf_words"] = []
 
+        # --------------------------
+        # Optional OpenAI refinement
+        # --------------------------
+        try_use_openai = False
+        try:
+            # If avg_conf is missing, we may still want to try; otherwise use threshold
+            if OPENAI_API_KEY:
+                if avg_conf is None:
+                    try_use_openai = True
+                else:
+                    try_use_openai = float(avg_conf) < float(OPENAI_CONFIDENCE_THRESHOLD)
+        except Exception:
+            try_use_openai = False
+
+        if try_use_openai:
+            ai_parsed, ai_err = call_openai_refine(raw_text, extracted, low_conf_words=extracted.get("_ocr_low_conf_words", []))
+            if ai_parsed:
+                # Merge carefully: prefer AI parsed values when non-empty; if AI returned empty, keep original
+                for key in ["name", "designation", "company", "phone_numbers", "email", "website", "address", "social_links", "more_details", "additional_notes"]:
+                    val = ai_parsed.get(key)
+                    # prefer non-empty lists/strings from AI; otherwise keep extracted
+                    if val not in (None, "", [], {}):
+                        extracted[key] = val
+            else:
+                logging.info(f"OpenAI refine skipped/failed: {ai_err}")
+
         # classify & enrich before storing (computes validations but leaves more_details empty)
         extracted = classify_contact(extracted)
 
         # ensure more_details is empty for newly created records (user will fill later)
-        extracted["more_details"] = ""
+        extracted["more_details"] = extracted.get("more_details", "") or ""
         extracted["created_at"] = now_ist()
         extracted["edited_at"] = ""
 
@@ -786,5 +945,3 @@ def delete_card(card_id: str):
     except Exception as e:
         logging.exception("delete_card error")
         raise HTTPException(status_code=500, detail=str(e))
-
-
