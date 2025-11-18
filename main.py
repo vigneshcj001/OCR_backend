@@ -1,11 +1,10 @@
-# main.py (FastAPI backend with optional OpenAI refinement)
+# File: main.py (FastAPI backend)
 import os
 import io
 import re
-import json
 import logging
 from datetime import datetime
-from typing import List, Optional, Any, Dict, Tuple
+from typing import List, Optional, Any, Dict
 
 from fastapi import FastAPI, File, UploadFile, Body, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,15 +12,14 @@ from pydantic import BaseModel, validator
 from pymongo import MongoClient
 from bson import ObjectId
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
-import pytesseract
-from pytesseract import Output
 from dotenv import load_dotenv
 import pytz
 
 # --- Additional libs for classification/validation / preprocessing ---
 import numpy as np
 import cv2
-import requests as _requests  # used for OpenAI REST call
+
+# --- Additional libs for classification/validation ---
 import phonenumbers
 import tldextract
 import validators
@@ -33,6 +31,11 @@ try:
 except Exception:
     nlp = None
 
+# OpenAI (Vision) client
+# Requires: pip install openai
+from openai import OpenAI
+import base64
+
 # Load .env
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -40,16 +43,17 @@ DB_NAME = os.getenv("DB_NAME", "business_cards")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "contacts")
 PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IN")  # default phone region
 
-# OpenAI config (env)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # change to model you have access to
-OPENAI_CONFIDENCE_THRESHOLD = float(os.getenv("OPENAI_CONFIDENCE_THRESHOLD", "80"))  # call OpenAI if avg_conf < threshold
-
-# Optional: explicitly set tesseract binary if not on PATH
-# pytesseract.pytesseract.tesseract_cmd = r"/usr/bin/tesseract"  # adjust path if necessary
+# OpenAI config
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini-vision")
+if OPENAI_API_KEY:
+    openai_client = OpenAI(api_key=OPENAI_API_KEY)
+else:
+    # will also attempt to read from environment if not passed explicitly
+    openai_client = OpenAI()
 
 # FastAPI setup
-app = FastAPI(title="Business Card OCR API (with optional OpenAI refinement)")
+app = FastAPI(title="Business Card OCR API (OpenAI Vision)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -129,7 +133,7 @@ def preprocess_pil_image(pil_img: Image.Image, upscale: bool = True) -> Image.Im
     """
     Convert to RGB, grayscale, upscale if small, denoise, adaptive threshold,
     mild sharpening and contrast. Returns a PIL Image (binary/thresholded)
-    suitable for Tesseract.
+    suitable for OCR.
     """
     # Ensure RGB then convert to numpy
     img = pil_img.convert("RGB")
@@ -172,7 +176,6 @@ def extract_details(text: str) -> Dict[str, Any]:
     OCR parsing with improved logic to avoid picking company as name.
     Prioritizes ALL-CAPS prominent lines near the top as person names and,
     if company and name collide, searches for alternatives anywhere in the card.
-    (This is your pre-existing heuristic — kept mostly unchanged.)
     """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
@@ -636,98 +639,87 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
     return c
 
 # -----------------------------------------
-# OpenAI refinement helper
+# OpenAI Vision / OCR helper (primary OCR)
 # -----------------------------------------
-def call_openai_refine(raw_text: str, extracted: dict, low_conf_words: list = None, model: str = None, timeout: int = 30) -> Tuple[Optional[dict], Optional[str]]:
+def openai_vision_extract_text_from_bytes(image_bytes: bytes, model: str = OPENAI_VISION_MODEL) -> str:
     """
-    Ask OpenAI to refine/clean OCR output. Returns (parsed_dict, error_str).
-    Returns None, error_str on failure. parsed_dict contains the 10 expected keys.
+    Send the image bytes to OpenAI Vision model and request only the extracted
+    text. Returns a single string with extracted text (newlines preserved).
     """
-    model = model or OPENAI_MODEL
-    if not OPENAI_API_KEY:
-        return None, "OPENAI_API_KEY not configured"
-
-    low_conf_words = low_conf_words or []
-
-    system_msg = (
-        "You are a reliable data-extraction assistant. "
-        "Given raw OCR text and a best-effort parsed object, return a single JSON object "
-        "with EXACT keys: name, designation, company, phone_numbers, email, website, address, social_links, more_details, additional_notes. "
-        "Rules: phone_numbers and social_links must be arrays of strings (empty list if none). "
-        "All other fields must be strings (empty string if none). "
-        "Do NOT add any other keys. Be conservative: if uncertain, return empty string/list rather than inventing values."
-    )
-    user_msg = (
-        "Raw OCR text:\n"
-        f"{raw_text}\n\n"
-        "Low-confidence words (list):\n"
-        f"{json.dumps(low_conf_words)}\n\n"
-        "Current parsed fields (best-effort):\n"
-        f"{json.dumps(extracted, indent=2)}\n\n"
-        "Return ONLY the JSON object (no explanation)."
-    )
-
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_msg},
-            {"role": "user", "content": user_msg},
-        ],
-        "temperature": 0.0,
-        "max_tokens": 700,
-    }
-
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
     try:
-        r = _requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
-        j = r.json()
-        assistant_text = ""
-        if "choices" in j and len(j["choices"]) > 0:
-            assistant_text = j["choices"][0].get("message", {}).get("content", "") or j["choices"][0].get("text", "")
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        # Build a minimal Responses API style request
+        resp = openai_client.responses.create(
+            model=model,
+            input=[{
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Extract all visible text from the image. Return ONLY the text (no commentary), preserve newlines."},
+                    {"type": "input_image", "image_data": {"base64": b64}}
+                ]
+            }],
+            temperature=0.0,
+        )
 
-        # Try to load JSON; robust extraction if surrounds text
-        try:
-            parsed = json.loads(assistant_text)
-        except Exception:
-            m = re.search(r"(\{.*\})", assistant_text, re.S)
-            if m:
-                try:
-                    parsed = json.loads(m.group(1))
-                except Exception as e:
-                    return None, f"Failed to parse JSON from assistant: {e}"
-            else:
-                return None, "No JSON found in assistant response"
+        # Try a few strategies to extract the returned text
+        out_text = ""
 
-        # Normalize types
-        for key in ["phone_numbers", "social_links"]:
-            if key not in parsed or parsed[key] is None:
-                parsed[key] = []
-            elif isinstance(parsed[key], str):
-                parsed[key] = [s.strip() for s in parsed[key].split(",") if s.strip()]
-            elif not isinstance(parsed[key], list):
-                parsed[key] = list(parsed.get(key)) if parsed.get(key) else []
+        # 1) Some SDK versions expose output_text
+        if hasattr(resp, "output_text") and resp.output_text:
+            out_text = resp.output_text
 
-        for key in ["name", "designation", "company", "email", "website", "address", "more_details", "additional_notes"]:
-            if key not in parsed or parsed[key] is None:
-                parsed[key] = ""
-            else:
-                parsed[key] = str(parsed[key]).strip()
+        # 2) Structured 'output' list with content items
+        if not out_text:
+            try:
+                out_items = getattr(resp, "output", None) or (resp.get("output") if isinstance(resp, dict) else None)
+                if out_items:
+                    parts = []
+                    for it in out_items:
+                        if isinstance(it, dict):
+                            content = it.get("content", []) or []
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "output_text" and c.get("text"):
+                                    parts.append(c.get("text"))
+                                elif isinstance(c, str):
+                                    parts.append(c)
+                    if parts:
+                        out_text = "\n".join(parts)
+            except Exception:
+                pass
 
-        return parsed, None
+        # 3) Older shape: choices -> message -> content
+        if not out_text:
+            try:
+                choices = getattr(resp, "choices", None) or (resp.get("choices") if isinstance(resp, dict) else None)
+                if choices:
+                    text_chunks = []
+                    for ch in choices:
+                        msg = ch.get("message") if isinstance(ch, dict) else None
+                        if msg:
+                            # content can be string or structure
+                            content = msg.get("content")
+                            if isinstance(content, str):
+                                text_chunks.append(content)
+                            elif isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict) and c.get("type") == "output_text":
+                                        text_chunks.append(c.get("text", ""))
+                    if text_chunks:
+                        out_text = "\n".join([t for t in text_chunks if t])
+            except Exception:
+                pass
+
+        return out_text.strip() if out_text else ""
     except Exception as e:
-        return None, str(e)
+        logging.exception("OpenAI vision request failed")
+        return ""
 
 # -----------------------------------------
 # Routes
 # -----------------------------------------
 @app.get("/")
 def root():
-    return {"message": "OCR Backend Running ✅"}
+    return {"message": "OCR Backend Running ✅ (OpenAI Vision)"}
 
 @app.post("/upload_card", status_code=status.HTTP_201_CREATED)
 async def upload_card(file: UploadFile = File(...)):
@@ -735,27 +727,26 @@ async def upload_card(file: UploadFile = File(...)):
         content = await file.read()
         img = Image.open(io.BytesIO(content))
 
-        # PREPROCESS + OCR (robust)
+        # PREPROCESS + OCR (OpenAI Vision)
         try:
             proc_img = preprocess_pil_image(img, upscale=True)
 
-            # choose OCR config; psm 6 is good for a block of text, adjust for layout
-            ocr_config = "--oem 3 --psm 6"
-            raw_text = pytesseract.image_to_string(proc_img, config=ocr_config, lang='eng')
+            # convert processed PIL image back to bytes (PNG)
+            buf = io.BytesIO()
+            proc_img.save(buf, format="PNG")
+            img_bytes = buf.getvalue()
 
-            # detailed data (word-level) — gives confidence, bbox, text
-            ocr_data = pytesseract.image_to_data(proc_img, config=ocr_config, lang='eng', output_type=Output.DICT)
+            # Primary OCR via OpenAI Vision
+            raw_text = openai_vision_extract_text_from_bytes(img_bytes, model=os.getenv("OPENAI_VISION_MODEL", OPENAI_VISION_MODEL))
 
-            # build a simple confidence summary
-            confidences = []
-            for c in ocr_data.get("conf", []):
-                try:
-                    # pytesseract may output "-1" or "-1\n"
-                    conf = int(float(c))
-                    confidences.append(conf)
-                except Exception:
-                    pass
-            avg_conf = sum(confidences)/len(confidences) if confidences else None
+            # If OpenAI returned nothing, produce a minimal placeholder text (so downstream functions behave)
+            if not raw_text:
+                logging.warning("OpenAI Vision returned empty text; proceeding with empty OCR text.")
+                raw_text = ""
+
+            # Build a simple ocr_data placeholder (OpenAI does not return per-word confidences)
+            words = [w for w in re.split(r"\s+", raw_text) if w.strip()]
+            ocr_data = {"text": words}
 
         except Exception as e:
             logging.exception("ocr preprocessing error")
@@ -766,57 +757,17 @@ async def upload_card(file: UploadFile = File(...)):
 
         # store debug fields to help triage poor OCR results
         extracted["_raw_ocr_text"] = raw_text
-        extracted["_ocr_avg_confidence"] = avg_conf
+        extracted["_ocr_avg_confidence"] = None  # not available from OpenAI Vision
         extracted["_ocr_word_count"] = len([t for t in ocr_data.get("text", []) if t and t.strip()])
 
-        # optional: store low-confidence words (capped)
-        low_conf_words = []
-        try:
-            for i, w in enumerate(ocr_data.get("text", [])):
-                if not w or not w.strip():
-                    continue
-                try:
-                    conf = int(float(ocr_data.get("conf", [])[i]))
-                except Exception:
-                    conf = -1
-                if conf >= 0 and conf < 60:
-                    low_conf_words.append({"word": w, "conf": conf})
-            extracted["_ocr_low_conf_words"] = low_conf_words[:40]
-        except Exception:
-            # non-fatal: don't block processing if this debug step fails
-            extracted["_ocr_low_conf_words"] = []
-
-        # --------------------------
-        # Optional OpenAI refinement
-        # --------------------------
-        try_use_openai = False
-        try:
-            # If avg_conf is missing, we may still want to try; otherwise use threshold
-            if OPENAI_API_KEY:
-                if avg_conf is None:
-                    try_use_openai = True
-                else:
-                    try_use_openai = float(avg_conf) < float(OPENAI_CONFIDENCE_THRESHOLD)
-        except Exception:
-            try_use_openai = False
-
-        if try_use_openai:
-            ai_parsed, ai_err = call_openai_refine(raw_text, extracted, low_conf_words=extracted.get("_ocr_low_conf_words", []))
-            if ai_parsed:
-                # Merge carefully: prefer AI parsed values when non-empty; if AI returned empty, keep original
-                for key in ["name", "designation", "company", "phone_numbers", "email", "website", "address", "social_links", "more_details", "additional_notes"]:
-                    val = ai_parsed.get(key)
-                    # prefer non-empty lists/strings from AI; otherwise keep extracted
-                    if val not in (None, "", [], {}):
-                        extracted[key] = val
-            else:
-                logging.info(f"OpenAI refine skipped/failed: {ai_err}")
+        # optional: low_conf_words not available; leave empty
+        extracted["_ocr_low_conf_words"] = []
 
         # classify & enrich before storing (computes validations but leaves more_details empty)
         extracted = classify_contact(extracted)
 
         # ensure more_details is empty for newly created records (user will fill later)
-        extracted["more_details"] = extracted.get("more_details", "") or ""
+        extracted["more_details"] = ""
         extracted["created_at"] = now_ist()
         extracted["edited_at"] = ""
 
