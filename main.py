@@ -1,7 +1,11 @@
-# File: main.py (FastAPI backend)
+# main.py
+# OpenAI-vision-based OCR backend + CRUD routes
+# Requires: openai, fastapi, uvicorn, python-dotenv, pymongo, pillow, numpy, opencv-python
+
 import os
 import io
 import re
+import json
 import logging
 from datetime import datetime
 from typing import List, Optional, Any, Dict
@@ -11,53 +15,33 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 from pymongo import MongoClient
 from bson import ObjectId
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+from PIL import Image, ImageFilter, ImageEnhance
 from dotenv import load_dotenv
-import pytz
 
-# --- Additional libs for classification/validation / preprocessing ---
+# Image preprocessing libs (optional but recommended)
 import numpy as np
 import cv2
 
-# --- Additional libs for classification/validation ---
-import phonenumbers
-import tldextract
-import validators
-
-# Try loading spaCy NER (optional)
-try:
-    import spacy
-    nlp = spacy.load("en_core_web_sm")
-except Exception:
-    nlp = None
-
-# OpenAI (Vision) client
-# Requires: pip install openai
-from openai import OpenAI
-import base64
+# OpenAI client
+import openai
 
 # Load .env
 load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY must be set in env")
+openai.api_key = OPENAI_API_KEY
+
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "business_cards")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "contacts")
-PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IN")  # default phone region
-
-# OpenAI config
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", None)
-OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini-vision")
-if OPENAI_API_KEY:
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-else:
-    # will also attempt to read from environment if not passed explicitly
-    openai_client = OpenAI()
+PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IN")
 
 # FastAPI setup
-app = FastAPI(title="Business Card OCR API (OpenAI Vision)")
-
+app = FastAPI(title="Business Card OCR API")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to allowed origins in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -89,7 +73,7 @@ class ContactCreate(BaseModel):
     designation: Optional[str] = ""
     company: Optional[str] = ""
     phone_numbers: Optional[List[str]] = []
-    email: Optional[str] = ""          # allow empty string; validated below
+    email: Optional[str] = ""
     website: Optional[str] = ""
     address: Optional[str] = ""
     social_links: Optional[List[str]] = []
@@ -119,348 +103,24 @@ class ContactCreate(BaseModel):
         v = (v or "").strip()
         if v == "":
             return ""
-        # Use validators package to check email format; clearer error reporting
-        if validators.email(v):
+        # simple regex check
+        if re.match(r"^[\w\.-]+@[\w\.-]+\.\w+$", v):
             return v
         raise ValueError("email must be a valid email address or empty")
 
 # -----------------------------------------
-# Utilities: OCR preprocessing + parsing + heuristics
+# Simple normalization & heuristics (no external libs)
 # -----------------------------------------
-from difflib import SequenceMatcher
+EMAIL_RE = re.compile(r"[\w\.-]+@[\w\.-]+\.\w+", re.I)
+PHONE_RE = re.compile(r"\+?\d[\d \-\(\)xextEXT]{6,}\d")
+WEBSITE_RE = re.compile(r"(https?://)?(www\.)?([A-Za-z0-9\-]+\.[A-Za-z]{2,})(/[^\s]*)?", re.I)
 
-def preprocess_pil_image(pil_img: Image.Image, upscale: bool = True) -> Image.Image:
-    """
-    Convert to RGB, grayscale, upscale if small, denoise, adaptive threshold,
-    mild sharpening and contrast. Returns a PIL Image (binary/thresholded)
-    suitable for OCR.
-    """
-    # Ensure RGB then convert to numpy
-    img = pil_img.convert("RGB")
-    arr = np.array(img)
-
-    # Convert to gray
-    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-
-    # Optional upscale to improve OCR on small images
-    h, w = gray.shape
-    if upscale and max(h, w) < 1200:
-        scale = max(1.0, 1200.0 / max(h, w))
-        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
-
-    # Denoise (bilateral preserves edges)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
-
-    # Adaptive thresholding for uneven lighting
-    try:
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, 31, 15)
-    except Exception:
-        # fallback to Otsu
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # Morphological open (remove speckles)
-    kernel = np.ones((1, 1), np.uint8)
-    processed = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
-
-    pil_proc = Image.fromarray(processed)
-
-    # Mild sharpening and contrast increase
-    pil_proc = pil_proc.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=3))
-    pil_proc = ImageEnhance.Contrast(pil_proc).enhance(1.15)
-
-    return pil_proc
-
-def extract_details(text: str) -> Dict[str, Any]:
-    """
-    OCR parsing with improved logic to avoid picking company as name.
-    Prioritizes ALL-CAPS prominent lines near the top as person names and,
-    if company and name collide, searches for alternatives anywhere in the card.
-    """
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    raw_text = " ".join(lines)
-
-    data = {
-        "name": "",
-        "designation": "",
-        "company": "",
-        "phone_numbers": [],
-        "email": "",
-        "website": "",
-        "address": "",
-        "social_links": [],
-        "more_details": "",
-        "additional_notes": raw_text,
-    }
-
-    # Helper tokens
-    company_keywords = [
-        "pvt", "private", "ltd", "llp", "inc", "solutions",
-        "technologies", "tech", "corporation", "company", "corp", "industries", "works", "enterprises"
-    ]
-    address_tokens = [
-        "street", "st", "road", "rd", "nagar", "lane", "city", "tamilnadu", "india", "pincode",
-        "pin", "near", "opp", "zip", "avenue", "av", "bldg", "building", "suite", "ste", "floor",
-        "coimbatore", "peelamedu"
-    ]
-
-    # EMAIL
-    email_m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw_text)
-    data["email"] = email_m.group(0) if email_m else ""
-
-    # WEBSITE (slightly improved pattern)
-    website_m = re.search(
-        r"\b(?:https?://|www\.)[^\s,;)\]]+|\b([A-Za-z0-9\-]+\.(?:com|in|net|org|co|io|biz|info|xyz|me))\b",
-        raw_text,
-        re.I,
-    )
-    data["website"] = website_m.group(0) if website_m else ""
-
-    # PHONES (exclude very short)
-    phones = re.findall(r"\+?\d[\d \-\(\)xextEXT]{6,}\d", raw_text)
-    normed = []
-    for p in phones:
-        cleaned = re.sub(r"[^\d\+]", "", p)
-        digits_only = re.sub(r"[^\d]", "", cleaned)
-        if len(digits_only) >= 8:
-            normed.append(cleaned)
-    data["phone_numbers"] = list(dict.fromkeys(normed))
-
-    # SOCIAL LINKS / HANDLES
-    for l in lines:
-        low = l.lower()
-        if any(s in low for s in ["linkedin", "instagram", "facebook", "twitter", "x.com", "t.me", "wa.me", "telegram"]):
-            data["social_links"].append(l.strip())
-        else:
-            if re.search(r"[a-z0-9_\-]+-[a-z0-9_\-]+", low) and "@" not in low:
-                data["social_links"].append(l.strip())
-
-    # DESIGNATION
-    designation_keywords = [
-        "founder", "ceo", "cto", "coo", "manager",
-        "director", "engineer", "consultant", "head", "lead",
-        "president", "vp", "vice", "principal", "officer"
-    ]
-    for line in lines:
-        low = line.lower()
-        if any(kw in low for kw in designation_keywords):
-            words = line.split()
-            limited = " ".join(words[:6])
-            clean = re.sub(r"[^A-Za-z&\s\-\./]", " ", limited).strip()
-            clean = re.sub(r"\b(?:fm|fin|fmr)\b", "", clean, flags=re.I).strip()
-            tokens = [t for t in clean.split() if not re.search(r"-", t)]
-            data["designation"] = re.sub(r"\s{2,}", " ", " ".join(tokens)).strip()
-            break
-
-    # COMPANY detection
-    company_candidates = []
-    for idx, line in enumerate(lines):
-        low = line.lower().strip()
-        if re.search(r"[\w\.-]+@[\w\.-]+", line) or re.search(r"\+?\d", line):
-            continue
-        if any(tok in low for tok in address_tokens):
-            continue
-        if any(kw in low for kw in company_keywords):
-            company_candidates.append((idx, line.strip()))
-    if not company_candidates:
-        for idx, line in enumerate(lines):
-            low = line.lower().strip()
-            if re.search(r"[\w\.-]+@[\w\.-]+", line) or re.search(r"\+?\d", line):
-                continue
-            if any(tok in low for tok in address_tokens):
-                continue
-            clean_alpha = re.sub(r"[^A-Za-z\s&\.\-]", "", line).strip()
-            if not clean_alpha:
-                continue
-            if 2 <= len(clean_alpha.split()) <= 6 and len(clean_alpha) <= 100:
-                if not (clean_alpha.replace(" ", "").isupper() and len(clean_alpha.split()) <= 4):
-                    company_candidates.append((idx, clean_alpha))
-                    break
-    if company_candidates:
-        company_candidates.sort(key=lambda t: 0 if any(k in t[1].lower() for k in ["private", "pvt", "ltd", "llp", "inc"]) else 1)
-        data["company"] = company_candidates[0][1].strip()
-        company_idx = company_candidates[0][0]
-    else:
-        data["company"] = ""
-        company_idx = None
-
-    # NAME detection with strong preference rules
-    top_region = lines[:6] if len(lines) >= 6 else lines
-
-    def is_person_like(l):
-        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
-        if not cleaned:
-            return False
-        words = cleaned.split()
-        return 1 <= len(words) <= 4 and len(cleaned) <= 60
-
-    def is_all_caps_word(l):
-        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
-        if not cleaned:
-            return False
-        words = cleaned.split()
-        if len(words) > 2:
-            return False
-        return all(w.isupper() and 2 <= len(w) <= 20 for w in words)
-
-    def similar(a, b):
-        return SequenceMatcher(None, (a or "").lower(), (b or "").lower()).ratio()
-
-    name_candidate = ""
-
-    # 1) ALL-CAPS lines in top region that are not company/address/phone/email
-    for idx, l in enumerate(top_region):
-        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
-        if cleaned and cleaned.replace(" ", "").isupper() and 1 < len(cleaned.split()) <= 4:
-            low = l.lower()
-            if not any(kw in low for kw in company_keywords) and not any(tok in low for tok in address_tokens) and "@" not in low and not re.search(r"\+?\d", l):
-                name_candidate = cleaned.title()
-                break
-
-    # 2) Title-case / capitalized line in top region
-    if not name_candidate:
-        for idx, l in enumerate(top_region):
-            if not is_person_like(l):
-                continue
-            low = l.lower()
-            if any(kw in low for kw in company_keywords) or any(tok in low for tok in address_tokens) or "@" in low or re.search(r"\+?\d", l):
-                continue
-            words = re.sub(r"[^A-Za-z\s]", "", l).strip().split()
-            capitalized = sum(1 for w in words if w[:1].isupper())
-            if capitalized >= 1:
-                name_candidate = " ".join([w.capitalize() for w in words])
-                break
-
-    # 3) spaCy PERSON (if available)
-    if not name_candidate and nlp:
-        try:
-            doc = nlp(" ".join(lines))
-            persons = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
-            if persons:
-                for p in persons:
-                    p_clean = p.strip()
-                    if p_clean and len(p_clean.split()) <= 4:
-                        name_candidate = p_clean
-                        break
-        except Exception:
-            pass
-
-    # 4) Conservative scan for any person-like line (fallback)
-    if not name_candidate:
-        for idx, l in enumerate(lines):
-            if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
-                continue
-            low = l.lower()
-            if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
-                continue
-            cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
-            if cleaned and 1 <= len(cleaned.split()) <= 4:
-                name_candidate = " ".join([w.capitalize() for w in cleaned.split()])
-                break
-
-    # Additional fallbacks...
-    if not name_candidate:
-        uppercase_lines = []
-        for l in lines:
-            clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
-            if clean and clean.replace(" ", "").isupper() and len(clean.split()) <= 4:
-                uppercase_lines.append(clean)
-        if uppercase_lines:
-            name_candidate = uppercase_lines[0].title()
-        else:
-            for l in lines:
-                if l == data.get("company") or l == data.get("designation"):
-                    continue
-                if re.search(r"[\w\.-]+@[\w\.-]+", l):
-                    continue
-                if re.search(r"\+?\d", l):
-                    continue
-                if 1 <= len(l.split()) <= 4 and len(l) < 60:
-                    candidate_clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
-                    if candidate_clean:
-                        name_candidate = " ".join([w.capitalize() for w in candidate_clean.split()])
-                        break
-
-    # If candidate looks like the company, attempt alternatives
-    if name_candidate:
-        comp = (data.get("company") or "").strip()
-        low_name = name_candidate.lower()
-        low_comp = comp.lower()
-        looks_like_company = any(kw in low_name for kw in company_keywords) or (low_comp and (low_comp in low_name or low_name in low_comp)) or (comp and similar(low_name, low_comp) > 0.6)
-        if looks_like_company:
-            alt_candidate = ""
-            search_limit = company_idx if company_idx is not None else min(len(lines), 6)
-            for i in range(0, search_limit):
-                l = lines[i]
-                if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
-                    continue
-                low = l.lower()
-                if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
-                    continue
-                if is_person_like(l):
-                    cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
-                    if cleaned and cleaned.replace(" ", "").isupper():
-                        alt_candidate = cleaned.title()
-                        break
-                    words = cleaned.split()
-                    capitalized = sum(1 for w in words if w[:1].isupper())
-                    if capitalized >= 1:
-                        alt_candidate = " ".join([w.capitalize() for w in words])
-                        break
-            if not alt_candidate:
-                for i, l in enumerate(lines):
-                    if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
-                        continue
-                    low = l.lower()
-                    if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
-                        continue
-                    if is_all_caps_word(l):
-                        candidate_upper = re.sub(r"[^A-Za-z\s]", "", l).strip()
-                        if comp and similar(candidate_upper, comp) > 0.7:
-                            continue
-                        alt_candidate = candidate_upper.title()
-                        break
-            if alt_candidate:
-                name_candidate = alt_candidate
-            else:
-                name_candidate = re.sub(r"\b(private|pvt|ltd|llp|inc|technologies|tech|works|solutions)\b", "", name_candidate, flags=re.I).strip()
-
-    data["name"] = (name_candidate or "").strip()
-
-    # ADDRESS extraction
-    address_lines = []
-    for l in lines:
-        if re.search(r"\b\d{6}\b", l) or re.search(r"\b(?:street|st|road|rd|nagar|lane|peelamedu|city|tamil nadu|coimbatore|near|opp)\b", l, re.I):
-            address_lines.append(l)
-    if address_lines:
-        data["address"] = ", ".join(address_lines)
-
-    # Trim & cleanup
-    for k in ["name", "designation", "company", "address", "email", "website", "more_details"]:
-        if isinstance(data.get(k), str):
-            data[k] = data[k].strip()
-
-    data["name"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("name", ""))
-    data["company"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("company", ""))
-
-    return data
-
-# -----------------------------------------
-# Timestamp helper
-# -----------------------------------------
-def now_ist() -> str:
-    ist = pytz.timezone("Asia/Kolkata")
-    return datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
-
-# -----------------------------------------
-# Classification helpers (unchanged)
-# -----------------------------------------
 SOCIAL_PLATFORMS = {
     "linkedin": ["linkedin.com", "linkedin"],
     "twitter": ["twitter.com", "x.com", "t.co", "twitter"],
-    "instagram": ["instagram.com", "instagr.am", "instagram"],
+    "instagram": ["instagram.com", "instagr.am"],
     "facebook": ["facebook.com", "fb.me", "facebook"],
-    "telegram": ["t.me", "telegram.me", "telegram"],
+    "telegram": ["t.me", "telegram.me"],
     "whatsapp": ["wa.me", "whatsapp"]
 }
 
@@ -470,8 +130,6 @@ COMPANY_KEYWORDS_LABELS = [
     ("Inc", ["inc", "inc."]),
     ("LLP", ["llp"]),
     ("Solutions", ["solutions"]),
-    ("Technologies", ["technologies", "tech"]),
-    ("Works", ["works"])
 ]
 
 ADDRESS_COUNTRY_KEYWORDS = {
@@ -480,14 +138,167 @@ ADDRESS_COUNTRY_KEYWORDS = {
     "UK": ["united kingdom", "england", "london", "uk"],
 }
 
+def normalize_phones(raw_phone_matches: List[str]) -> List[str]:
+    out = []
+    for p in raw_phone_matches:
+        cleaned = re.sub(r"[^\d\+xX]", "", p)
+        digits_only = re.sub(r"[^\d]", "", cleaned)
+        if len(digits_only) >= 8:
+            out.append(cleaned)
+    seen = set()
+    ret = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            ret.append(x)
+    return ret
+
+def extract_website_from_text(text: str) -> str:
+    m = WEBSITE_RE.search(text)
+    if not m:
+        return ""
+    # return the matched host + path if present
+    return (m.group(0) or "").strip()
+
+# -----------------------------------------
+# Preprocessing (PIL + OpenCV)
+# -----------------------------------------
+from PIL import Image
+
+def preprocess_pil_image(pil_img: Image.Image, upscale: bool = True) -> Image.Image:
+    img = pil_img.convert("RGB")
+    arr = np.array(img)
+
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    h, w = gray.shape
+    if upscale and max(h, w) < 1200:
+        scale = max(1.0, 1200.0 / max(h, w))
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+
+    try:
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 31, 15)
+    except Exception:
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    kernel = np.ones((1, 1), np.uint8)
+    processed = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+    pil_proc = Image.fromarray(processed)
+    pil_proc = pil_proc.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=3))
+    pil_proc = ImageEnhance.Contrast(pil_proc).enhance(1.15)
+    return pil_proc
+
+# -----------------------------------------
+# OCR via OpenAI Vision (strict JSON output)
+# -----------------------------------------
+
+def ocr_with_openai_image_bytes(image_bytes: bytes) -> Dict[str, Any]:
+    import base64
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:image/jpeg;base64,{b64}"
+
+    system = (
+        "You are an OCR assistant. You will receive an image (data URL). "
+        "Extract contact card fields. Reply ONLY with valid JSON (no explanation, no markdown). "
+        "Fields: name, designation, company, phone_numbers (list), email, website, address, social_links (list), raw_text. "
+        "If a field is not found, return empty string or empty list for phone_numbers/social_links. "
+        "Make phone numbers readable and preserve plus/extension characters. Do not invent data."
+    )
+
+    user = f"Image: {data_url}\n\nExtract the fields requested."
+    model_name = os.getenv("OPENAI_VISION_MODEL", "gpt-4o-mini-vision")
+
+    try:
+        resp = openai.ChatCompletion.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user}
+            ],
+            max_tokens=1500,
+            temperature=0.0
+        )
+
+        assistant_text = ""
+        if resp and "choices" in resp and len(resp["choices"]) > 0:
+            assistant_text = resp["choices"][0]["message"]["content"].strip()
+
+        try:
+            parsed = json.loads(assistant_text)
+        except Exception:
+            m = re.search(r"\{.*\}", assistant_text, re.S)
+            if m:
+                try:
+                    parsed = json.loads(m.group(0))
+                except Exception:
+                    parsed = {"raw_text": assistant_text}
+            else:
+                parsed = {"raw_text": assistant_text}
+        return parsed
+
+    except Exception:
+        logging.exception("OpenAI OCR error")
+        raise
+
+
+def extract_details_via_openai(pil_image: Image.Image) -> Dict[str, Any]:
+    proc = preprocess_pil_image(pil_image, upscale=True)
+    buf = io.BytesIO()
+    proc.save(buf, format="JPEG", quality=90)
+    image_bytes = buf.getvalue()
+
+    model_output = ocr_with_openai_image_bytes(image_bytes)
+
+    data = {
+        "name": model_output.get("name", "") if isinstance(model_output.get("name", ""), str) else "",
+        "designation": model_output.get("designation", "") if isinstance(model_output.get("designation", ""), str) else "",
+        "company": model_output.get("company", "") if isinstance(model_output.get("company", ""), str) else "",
+        "phone_numbers": model_output.get("phone_numbers", []) if isinstance(model_output.get("phone_numbers", []), list) else [],
+        "email": model_output.get("email", "") if isinstance(model_output.get("email", ""), str) else "",
+        "website": model_output.get("website", "") if isinstance(model_output.get("website", ""), str) else "",
+        "address": model_output.get("address", "") if isinstance(model_output.get("address", ""), str) else "",
+        "social_links": model_output.get("social_links", []) if isinstance(model_output.get("social_links", []), list) else [],
+        "more_details": "",
+        "additional_notes": model_output.get("raw_text", "") if isinstance(model_output.get("raw_text", ""), str) else ""
+    }
+
+    raw = model_output.get("raw_text", "") or ""
+    if not data["email"]:
+        m = EMAIL_RE.search(raw)
+        if m:
+            data["email"] = m.group(0)
+
+    if not data["website"]:
+        w = extract_website_from_text(raw)
+        if w:
+            data["website"] = w
+
+    if not data["phone_numbers"]:
+        phones = PHONE_RE.findall(raw)
+        data["phone_numbers"] = normalize_phones(phones)
+
+    data["phone_numbers"] = list(dict.fromkeys(data["phone_numbers"]))
+    data["social_links"] = list(dict.fromkeys(data["social_links"]))
+
+    return data
+
+# -----------------------------------------
+# Lightweight classify_contact (no external libs)
+# -----------------------------------------
+
 def _detect_social_platforms(links: List[str]) -> List[str]:
     found = set()
     for link in links or []:
-        low = link.lower()
+        low = (link or "").lower()
         for platform, tests in SOCIAL_PLATFORMS.items():
             if any(t in low for t in tests):
                 found.add(platform)
     return sorted(found)
+
 
 def _guess_company_type(company: str) -> str:
     if not company:
@@ -499,6 +310,7 @@ def _guess_company_type(company: str) -> str:
                 return label
     return ""
 
+
 def _guess_address_country(address: str) -> str:
     if not address:
         return ""
@@ -509,46 +321,10 @@ def _guess_address_country(address: str) -> str:
                 return country
     return ""
 
-def parse_phones(phone_list: List[str]) -> List[Dict[str, Any]]:
-    out = []
-    for raw in phone_list or []:
-        candidate = re.sub(r"[^\d\+xX]", "", raw)
-        try:
-            parsed = phonenumbers.parse(candidate, PHONE_DEFAULT_REGION)
-            is_valid = phonenumbers.is_valid_number(parsed)
-            e164 = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164) if is_valid else candidate
-            phone_type = None
-            try:
-                phone_type = phonenumbers.number_type(parsed).name
-            except Exception:
-                phone_type = None
-            out.append({
-                "raw": raw,
-                "normalized": e164,
-                "country_code": getattr(parsed, "country_code", None),
-                "national_number": getattr(parsed, "national_number", None),
-                "valid": bool(is_valid),
-                "type": phone_type
-            })
-        except Exception:
-            out.append({
-                "raw": raw,
-                "normalized": None,
-                "country_code": None,
-                "national_number": None,
-                "valid": False,
-                "type": None
-            })
-    return out
 
 def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Validate & enrich contact. Keeps field_validations but leaves more_details empty
-    unless provided by the caller (frontend controls it).
-    """
-    c = dict(contact)  # shallow copy
+    c = dict(contact)
 
-    # Normalize types
     phones = c.get("phone_numbers") or []
     if isinstance(phones, str):
         phones = [p.strip() for p in phones.split(",") if p.strip()]
@@ -565,53 +341,37 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
     notes = (c.get("additional_notes") or "").strip()
     designation = (c.get("designation") or "").strip()
 
-    # Email validation
-    email_valid = bool(validators.email(email)) if email else False
+    email_valid = bool(EMAIL_RE.match(email)) if email else False
 
-    # Website validation & domain
     website_valid = False
     domain = ""
     if website:
-        website_try = website if website.startswith(("http://", "https://")) else ("http://" + website)
-        website_valid = bool(validators.url(website_try))
-        te = tldextract.extract(website)
-        if te and te.domain:
-            domain = ".".join([p for p in [te.domain, te.suffix] if p])
+        m = WEBSITE_RE.search(website)
+        website_valid = bool(m)
+        if m:
+            domain = m.group(3) or ""
 
-    # Phones parse
-    phones_parsed = parse_phones(phones)
+    phones_parsed = []
+    for raw in phones or []:
+        candidate = re.sub(r"[^\d\+xX]", "", raw)
+        valid = len(re.sub(r"[^\d]", "", candidate)) >= 8
+        phones_parsed.append({
+            "raw": raw,
+            "normalized": candidate if valid else None,
+            "valid": bool(valid)
+        })
 
-    # Social platform detection (include email + website)
-    social_platforms = _detect_social_platforms(socials + [website] + [email])
+    social_platforms = _detect_social_platforms(socials + ([website] if website else []) + ([email] if email else []))
 
-    # Company type & address country
     company_type = _guess_company_type(company)
     address_country = _guess_address_country(address)
 
-    # Name heuristics
     name_is_upper = bool(name and name.replace(" ", "").isupper())
     name_word_count = len(name.split()) if name else 0
 
-    # NER quick check using spaCy (optional)
-    ner_org = ""
-    ner_gpe = ""
-    if nlp and (company or address or name):
-        try:
-            txt = " ".join([x for x in [name, company, address] if x])
-            doc = nlp(txt)
-            orgs = [ent.text for ent in doc.ents if ent.label_ == "ORG"]
-            gpes = [ent.text for ent in doc.ents if ent.label_ in ("GPE", "LOC")]
-            ner_org = orgs[0] if orgs else ""
-            ner_gpe = gpes[0] if gpes else ""
-        except Exception:
-            ner_org = ""
-            ner_gpe = ""
-
-    # Notes stats
     notes_len = len(notes)
     lines_in_notes = len([l for l in notes.splitlines() if l.strip()])
 
-    # Build structured validation doc
     field_validations = {
         "email": {"value": email, "valid": email_valid},
         "website": {"value": website, "valid": website_valid, "domain": domain},
@@ -620,106 +380,35 @@ def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
         "company_type_guess": company_type,
         "address_country_hint": address_country,
         "name": {"value": name, "is_uppercase": name_is_upper, "word_count": name_word_count},
-        "ner_org": ner_org,
-        "ner_gpe": ner_gpe,
         "notes": {"length": notes_len, "lines": lines_in_notes},
         "designation": {"value": designation}
     }
 
     c["field_validations"] = field_validations
-
-    # Keep more_details empty unless provided
     if "more_details" not in c or not c.get("more_details"):
         c["more_details"] = ""
-
-    # Ensure normalized types
     c["phone_numbers"] = phones
     c["social_links"] = socials
-
     return c
 
 # -----------------------------------------
-# OpenAI Vision / OCR helper (primary OCR)
+# Timestamp helper
 # -----------------------------------------
-def openai_vision_extract_text_from_bytes(image_bytes: bytes, model: str = OPENAI_VISION_MODEL) -> str:
-    """
-    Send the image bytes to OpenAI Vision model and request only the extracted
-    text. Returns a single string with extracted text (newlines preserved).
-    """
+
+def now_ist() -> str:
     try:
-        b64 = base64.b64encode(image_bytes).decode("utf-8")
-        # Build a minimal Responses API style request
-        resp = openai_client.responses.create(
-            model=model,
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": "Extract all visible text from the image. Return ONLY the text (no commentary), preserve newlines."},
-                    {"type": "input_image", "image_data": {"base64": b64}}
-                ]
-            }],
-            temperature=0.0,
-        )
-
-        # Try a few strategies to extract the returned text
-        out_text = ""
-
-        # 1) Some SDK versions expose output_text
-        if hasattr(resp, "output_text") and resp.output_text:
-            out_text = resp.output_text
-
-        # 2) Structured 'output' list with content items
-        if not out_text:
-            try:
-                out_items = getattr(resp, "output", None) or (resp.get("output") if isinstance(resp, dict) else None)
-                if out_items:
-                    parts = []
-                    for it in out_items:
-                        if isinstance(it, dict):
-                            content = it.get("content", []) or []
-                            for c in content:
-                                if isinstance(c, dict) and c.get("type") == "output_text" and c.get("text"):
-                                    parts.append(c.get("text"))
-                                elif isinstance(c, str):
-                                    parts.append(c)
-                    if parts:
-                        out_text = "\n".join(parts)
-            except Exception:
-                pass
-
-        # 3) Older shape: choices -> message -> content
-        if not out_text:
-            try:
-                choices = getattr(resp, "choices", None) or (resp.get("choices") if isinstance(resp, dict) else None)
-                if choices:
-                    text_chunks = []
-                    for ch in choices:
-                        msg = ch.get("message") if isinstance(ch, dict) else None
-                        if msg:
-                            # content can be string or structure
-                            content = msg.get("content")
-                            if isinstance(content, str):
-                                text_chunks.append(content)
-                            elif isinstance(content, list):
-                                for c in content:
-                                    if isinstance(c, dict) and c.get("type") == "output_text":
-                                        text_chunks.append(c.get("text", ""))
-                    if text_chunks:
-                        out_text = "\n".join([t for t in text_chunks if t])
-            except Exception:
-                pass
-
-        return out_text.strip() if out_text else ""
-    except Exception as e:
-        logging.exception("OpenAI vision request failed")
-        return ""
+        import pytz
+        ist = pytz.timezone("Asia/Kolkata")
+        return datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
 # -----------------------------------------
 # Routes
 # -----------------------------------------
 @app.get("/")
 def root():
-    return {"message": "OCR Backend Running ✅ (OpenAI Vision)"}
+    return {"message": "OCR Backend Running ✅"}
 
 @app.post("/upload_card", status_code=status.HTTP_201_CREATED)
 async def upload_card(file: UploadFile = File(...)):
@@ -727,46 +416,18 @@ async def upload_card(file: UploadFile = File(...)):
         content = await file.read()
         img = Image.open(io.BytesIO(content))
 
-        # PREPROCESS + OCR (OpenAI Vision)
         try:
-            proc_img = preprocess_pil_image(img, upscale=True)
-
-            # convert processed PIL image back to bytes (PNG)
-            buf = io.BytesIO()
-            proc_img.save(buf, format="PNG")
-            img_bytes = buf.getvalue()
-
-            # Primary OCR via OpenAI Vision
-            raw_text = openai_vision_extract_text_from_bytes(img_bytes, model=os.getenv("OPENAI_VISION_MODEL", OPENAI_VISION_MODEL))
-
-            # If OpenAI returned nothing, produce a minimal placeholder text (so downstream functions behave)
-            if not raw_text:
-                logging.warning("OpenAI Vision returned empty text; proceeding with empty OCR text.")
-                raw_text = ""
-
-            # Build a simple ocr_data placeholder (OpenAI does not return per-word confidences)
-            words = [w for w in re.split(r"\s+", raw_text) if w.strip()]
-            ocr_data = {"text": words}
-
+            extracted = extract_details_via_openai(img)
         except Exception as e:
-            logging.exception("ocr preprocessing error")
-            raise HTTPException(status_code=500, detail=f"OCR processing failed: {e}")
+            logging.exception("ocr-with-openai failed")
+            raise HTTPException(status_code=500, detail=f"OCR with OpenAI failed: {e}")
 
-        # Extract structured details from OCR text
-        extracted = extract_details(raw_text)
+        extracted["_raw_ocr_text"] = extracted.get("additional_notes", "")
+        extracted["_ocr_avg_confidence"] = None
+        extracted["_ocr_word_count"] = len(extracted["_raw_ocr_text"].split())
 
-        # store debug fields to help triage poor OCR results
-        extracted["_raw_ocr_text"] = raw_text
-        extracted["_ocr_avg_confidence"] = None  # not available from OpenAI Vision
-        extracted["_ocr_word_count"] = len([t for t in ocr_data.get("text", []) if t and t.strip()])
-
-        # optional: low_conf_words not available; leave empty
-        extracted["_ocr_low_conf_words"] = []
-
-        # classify & enrich before storing (computes validations but leaves more_details empty)
         extracted = classify_contact(extracted)
 
-        # ensure more_details is empty for newly created records (user will fill later)
         extracted["more_details"] = ""
         extracted["created_at"] = now_ist()
         extracted["edited_at"] = ""
@@ -780,6 +441,7 @@ async def upload_card(file: UploadFile = File(...)):
         logging.exception("upload_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
+# ------------------  The routes you asked to add ------------------
 @app.post("/create_card", status_code=status.HTTP_201_CREATED)
 async def create_card(payload: ContactCreate):
     try:
