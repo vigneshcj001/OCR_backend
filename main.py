@@ -1,24 +1,47 @@
+# File: main.py (FastAPI backend)
 import os
 import io
 import re
+import logging
 from datetime import datetime
 from typing import List, Optional, Any, Dict
 
 from fastapi import FastAPI, File, UploadFile, Body, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, validator
+from pydantic import BaseModel, validator
 from pymongo import MongoClient
 from bson import ObjectId
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import pytesseract
+from pytesseract import Output
 from dotenv import load_dotenv
 import pytz
+
+# --- Additional libs for classification/validation / preprocessing ---
+import numpy as np
+import cv2
+
+# --- Additional libs for classification/validation ---
+import phonenumbers
+import tldextract
+import validators
+
+# Try loading spaCy NER (optional)
+try:
+    import spacy
+    nlp = spacy.load("en_core_web_sm")
+except Exception:
+    nlp = None
 
 # Load .env
 load_dotenv()
 MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME = os.getenv("DB_NAME", "business_cards")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "contacts")
+PHONE_DEFAULT_REGION = os.getenv("PHONE_DEFAULT_REGION", "IN")  # default phone region
+
+# Optional: explicitly set tesseract binary if not on PATH
+# pytesseract.pytesseract.tesseract_cmd = r"/usr/bin/tesseract"  # adjust path if necessary
 
 # FastAPI setup
 app = FastAPI(title="Business Card OCR API")
@@ -57,10 +80,11 @@ class ContactCreate(BaseModel):
     designation: Optional[str] = ""
     company: Optional[str] = ""
     phone_numbers: Optional[List[str]] = []
-    email: Optional[EmailStr] = ""
+    email: Optional[str] = ""          # allow empty string; validated below
     website: Optional[str] = ""
     address: Optional[str] = ""
     social_links: Optional[List[str]] = []
+    more_details: Optional[str] = ""
     additional_notes: Optional[str] = ""
 
     @validator("phone_numbers", pre=True)
@@ -81,10 +105,70 @@ class ContactCreate(BaseModel):
             return items
         return v
 
+    @validator("email", pre=True, always=True)
+    def empty_or_valid_email(cls, v):
+        v = (v or "").strip()
+        if v == "":
+            return ""
+        # Use validators package to check email format; clearer error reporting
+        if validators.email(v):
+            return v
+        raise ValueError("email must be a valid email address or empty")
+
 # -----------------------------------------
-# Utilities: extract_details (OCR parsing)
+# Utilities: OCR preprocessing + parsing + heuristics
 # -----------------------------------------
+from difflib import SequenceMatcher
+
+def preprocess_pil_image(pil_img: Image.Image, upscale: bool = True) -> Image.Image:
+    """
+    Convert to RGB, grayscale, upscale if small, denoise, adaptive threshold,
+    mild sharpening and contrast. Returns a PIL Image (binary/thresholded)
+    suitable for Tesseract.
+    """
+    # Ensure RGB then convert to numpy
+    img = pil_img.convert("RGB")
+    arr = np.array(img)
+
+    # Convert to gray
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+
+    # Optional upscale to improve OCR on small images
+    h, w = gray.shape
+    if upscale and max(h, w) < 1200:
+        scale = max(1.0, 1200.0 / max(h, w))
+        gray = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+
+    # Denoise (bilateral preserves edges)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+
+    # Adaptive thresholding for uneven lighting
+    try:
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                       cv2.THRESH_BINARY, 31, 15)
+    except Exception:
+        # fallback to Otsu
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Morphological open (remove speckles)
+    kernel = np.ones((1, 1), np.uint8)
+    processed = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+
+    pil_proc = Image.fromarray(processed)
+
+    # Mild sharpening and contrast increase
+    pil_proc = pil_proc.filter(ImageFilter.UnsharpMask(radius=1, percent=120, threshold=3))
+    pil_proc = ImageEnhance.Contrast(pil_proc).enhance(1.15)
+
+    return pil_proc
+
 def extract_details(text: str) -> Dict[str, Any]:
+    """
+    OCR parsing with improved logic to avoid picking company as name.
+    Prioritizes ALL-CAPS prominent lines near the top as person names and,
+    if company and name collide, searches for alternatives anywhere in the card.
+    (This is your pre-existing heuristic — kept mostly unchanged.)
+    """
     lines = [line.strip() for line in text.split("\n") if line.strip()]
     raw_text = " ".join(lines)
 
@@ -97,98 +181,454 @@ def extract_details(text: str) -> Dict[str, Any]:
         "website": "",
         "address": "",
         "social_links": [],
+        "more_details": "",
         "additional_notes": raw_text,
     }
 
+    # Helper tokens
+    company_keywords = [
+        "pvt", "private", "ltd", "llp", "inc", "solutions",
+        "technologies", "tech", "corporation", "company", "corp", "industries", "works", "enterprises"
+    ]
+    address_tokens = [
+        "street", "st", "road", "rd", "nagar", "lane", "city", "tamilnadu", "india", "pincode",
+        "pin", "near", "opp", "zip", "avenue", "av", "bldg", "building", "suite", "ste", "floor",
+        "coimbatore", "peelamedu"
+    ]
+
     # EMAIL
-    email = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw_text)
-    data["email"] = email.group(0) if email else ""
+    email_m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", raw_text)
+    data["email"] = email_m.group(0) if email_m else ""
 
-    # WEBSITE
-    website = re.search(r"(https?://\S+|www\.\S+)", raw_text)
-    data["website"] = website.group(0) if website else ""
+    # WEBSITE (slightly improved pattern)
+    website_m = re.search(
+        r"\b(?:https?://|www\.)[^\s,;)\]]+|\b([A-Za-z0-9\-]+\.(?:com|in|net|org|co|io|biz|info|xyz|me))\b",
+        raw_text,
+        re.I,
+    )
+    data["website"] = website_m.group(0) if website_m else ""
 
-    # PHONE NUMBERS
-    phones = re.findall(r"\+?\d[\d \-\(\)]{6,}\d", raw_text)
-    phones = [re.sub(r"[^\d\+]", "", p) for p in phones]
-    data["phone_numbers"] = list(dict.fromkeys(phones))  # dedupe
+    # PHONES (exclude very short)
+    phones = re.findall(r"\+?\d[\d \-\(\)xextEXT]{6,}\d", raw_text)
+    normed = []
+    for p in phones:
+        cleaned = re.sub(r"[^\d\+]", "", p)
+        digits_only = re.sub(r"[^\d]", "", cleaned)
+        if len(digits_only) >= 8:
+            normed.append(cleaned)
+    data["phone_numbers"] = list(dict.fromkeys(normed))
 
-    # SOCIAL LINKS
+    # SOCIAL LINKS / HANDLES
     for l in lines:
-        if "linkedin" in l.lower() or "in/" in l.lower() or "twitter" in l.lower() or "instagram" in l.lower():
+        low = l.lower()
+        if any(s in low for s in ["linkedin", "instagram", "facebook", "twitter", "x.com", "t.me", "wa.me", "telegram"]):
             data["social_links"].append(l.strip())
+        else:
+            if re.search(r"[a-z0-9_\-]+-[a-z0-9_\-]+", low) and "@" not in low:
+                data["social_links"].append(l.strip())
 
-    # -----------------------------------------
-    # IMPROVED DESIGNATION LOGIC
-    # -----------------------------------------
+    # DESIGNATION
     designation_keywords = [
         "founder", "ceo", "cto", "coo", "manager",
         "director", "engineer", "consultant", "head", "lead",
-        "president", "vp", "vice"
+        "president", "vp", "vice", "principal", "officer"
     ]
-
     for line in lines:
         low = line.lower()
-
         if any(kw in low for kw in designation_keywords):
-
-            # Extract first few words (designation usually small)
             words = line.split()
-            limited = " ".join(words[:4])  # keep only first 4 words
-
-            # Clean extra chars
-            clean = re.sub(r"[^A-Za-z&\s\-]", "", limited).strip()
-
-            data["designation"] = clean
+            limited = " ".join(words[:6])
+            clean = re.sub(r"[^A-Za-z&\s\-\./]", " ", limited).strip()
+            clean = re.sub(r"\b(?:fm|fin|fmr)\b", "", clean, flags=re.I).strip()
+            tokens = [t for t in clean.split() if not re.search(r"-", t)]
+            data["designation"] = re.sub(r"\s{2,}", " ", " ".join(tokens)).strip()
             break
 
-    # COMPANY heuristics
-    for line in lines:
-        if re.search(r"\b(pvt\b|private|ltd|llp|inc\b|corporation|company|works|solutions|technologies)\b", line, re.I):
-            data["company"] = line.strip()
-            break
-
-    # NAME heuristics
-    uppercase_lines = []
-    for l in lines:
-        clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
-        if clean and clean.replace(" ", "").isupper() and len(clean.split()) <= 4:
-            uppercase_lines.append(clean)
-    if uppercase_lines:
-        data["name"] = uppercase_lines[0]
+    # COMPANY detection
+    company_candidates = []
+    for idx, line in enumerate(lines):
+        low = line.lower().strip()
+        if re.search(r"[\w\.-]+@[\w\.-]+", line) or re.search(r"\+?\d", line):
+            continue
+        if any(tok in low for tok in address_tokens):
+            continue
+        if any(kw in low for kw in company_keywords):
+            company_candidates.append((idx, line.strip()))
+    if not company_candidates:
+        for idx, line in enumerate(lines):
+            low = line.lower().strip()
+            if re.search(r"[\w\.-]+@[\w\.-]+", line) or re.search(r"\+?\d", line):
+                continue
+            if any(tok in low for tok in address_tokens):
+                continue
+            clean_alpha = re.sub(r"[^A-Za-z\s&\.\-]", "", line).strip()
+            if not clean_alpha:
+                continue
+            if 2 <= len(clean_alpha.split()) <= 6 and len(clean_alpha) <= 100:
+                if not (clean_alpha.replace(" ", "").isupper() and len(clean_alpha.split()) <= 4):
+                    company_candidates.append((idx, clean_alpha))
+                    break
+    if company_candidates:
+        company_candidates.sort(key=lambda t: 0 if any(k in t[1].lower() for k in ["private", "pvt", "ltd", "llp", "inc"]) else 1)
+        data["company"] = company_candidates[0][1].strip()
+        company_idx = company_candidates[0][0]
     else:
-        for l in lines:
-            if l == data["company"] or l == data["designation"]:
-                continue
-            if re.search(r"[\w\.-]+@[\w\.-]+", l):
-                continue
-            if re.search(r"\+?\d", l):
-                continue
-            if 1 <= len(l.split()) <= 4 and len(l) < 60:
-                data["name"] = re.sub(r"[^A-Za-z\s]", "", l).strip()
+        data["company"] = ""
+        company_idx = None
+
+    # NAME detection with strong preference rules
+    top_region = lines[:6] if len(lines) >= 6 else lines
+
+    def is_person_like(l):
+        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+        if not cleaned:
+            return False
+        words = cleaned.split()
+        return 1 <= len(words) <= 4 and len(cleaned) <= 60
+
+    def is_all_caps_word(l):
+        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+        if not cleaned:
+            return False
+        words = cleaned.split()
+        if len(words) > 2:
+            return False
+        return all(w.isupper() and 2 <= len(w) <= 20 for w in words)
+
+    def similar(a, b):
+        return SequenceMatcher(None, (a or "").lower(), (b or "").lower()).ratio()
+
+    name_candidate = ""
+
+    # 1) ALL-CAPS lines in top region that are not company/address/phone/email
+    for idx, l in enumerate(top_region):
+        cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+        if cleaned and cleaned.replace(" ", "").isupper() and 1 < len(cleaned.split()) <= 4:
+            low = l.lower()
+            if not any(kw in low for kw in company_keywords) and not any(tok in low for tok in address_tokens) and "@" not in low and not re.search(r"\+?\d", l):
+                name_candidate = cleaned.title()
                 break
 
-    # ADDRESS heuristics
+    # 2) Title-case / capitalized line in top region
+    if not name_candidate:
+        for idx, l in enumerate(top_region):
+            if not is_person_like(l):
+                continue
+            low = l.lower()
+            if any(kw in low for kw in company_keywords) or any(tok in low for tok in address_tokens) or "@" in low or re.search(r"\+?\d", l):
+                continue
+            words = re.sub(r"[^A-Za-z\s]", "", l).strip().split()
+            capitalized = sum(1 for w in words if w[:1].isupper())
+            if capitalized >= 1:
+                name_candidate = " ".join([w.capitalize() for w in words])
+                break
+
+    # 3) spaCy PERSON (if available)
+    if not name_candidate and nlp:
+        try:
+            doc = nlp(" ".join(lines))
+            persons = [ent.text for ent in doc.ents if ent.label_ == "PERSON"]
+            if persons:
+                for p in persons:
+                    p_clean = p.strip()
+                    if p_clean and len(p_clean.split()) <= 4:
+                        name_candidate = p_clean
+                        break
+        except Exception:
+            pass
+
+    # 4) Conservative scan for any person-like line (fallback)
+    if not name_candidate:
+        for idx, l in enumerate(lines):
+            if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
+                continue
+            low = l.lower()
+            if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
+                continue
+            cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+            if cleaned and 1 <= len(cleaned.split()) <= 4:
+                name_candidate = " ".join([w.capitalize() for w in cleaned.split()])
+                break
+
+    # Additional fallbacks...
+    if not name_candidate:
+        uppercase_lines = []
+        for l in lines:
+            clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
+            if clean and clean.replace(" ", "").isupper() and len(clean.split()) <= 4:
+                uppercase_lines.append(clean)
+        if uppercase_lines:
+            name_candidate = uppercase_lines[0].title()
+        else:
+            for l in lines:
+                if l == data.get("company") or l == data.get("designation"):
+                    continue
+                if re.search(r"[\w\.-]+@[\w\.-]+", l):
+                    continue
+                if re.search(r"\+?\d", l):
+                    continue
+                if 1 <= len(l.split()) <= 4 and len(l) < 60:
+                    candidate_clean = re.sub(r"[^A-Za-z\s]", "", l).strip()
+                    if candidate_clean:
+                        name_candidate = " ".join([w.capitalize() for w in candidate_clean.split()])
+                        break
+
+    # If candidate looks like the company, attempt alternatives
+    if name_candidate:
+        comp = (data.get("company") or "").strip()
+        low_name = name_candidate.lower()
+        low_comp = comp.lower()
+        looks_like_company = any(kw in low_name for kw in company_keywords) or (low_comp and (low_comp in low_name or low_name in low_comp)) or (comp and similar(low_name, low_comp) > 0.6)
+        if looks_like_company:
+            alt_candidate = ""
+            search_limit = company_idx if company_idx is not None else min(len(lines), 6)
+            for i in range(0, search_limit):
+                l = lines[i]
+                if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
+                    continue
+                low = l.lower()
+                if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
+                    continue
+                if is_person_like(l):
+                    cleaned = re.sub(r"[^A-Za-z\s]", "", l).strip()
+                    if cleaned and cleaned.replace(" ", "").isupper():
+                        alt_candidate = cleaned.title()
+                        break
+                    words = cleaned.split()
+                    capitalized = sum(1 for w in words if w[:1].isupper())
+                    if capitalized >= 1:
+                        alt_candidate = " ".join([w.capitalize() for w in words])
+                        break
+            if not alt_candidate:
+                for i, l in enumerate(lines):
+                    if re.search(r"[\w\.-]+@[\w\.-]+", l) or re.search(r"\+?\d", l):
+                        continue
+                    low = l.lower()
+                    if any(tok in low for tok in address_tokens) or any(kw in low for kw in company_keywords):
+                        continue
+                    if is_all_caps_word(l):
+                        candidate_upper = re.sub(r"[^A-Za-z\s]", "", l).strip()
+                        if comp and similar(candidate_upper, comp) > 0.7:
+                            continue
+                        alt_candidate = candidate_upper.title()
+                        break
+            if alt_candidate:
+                name_candidate = alt_candidate
+            else:
+                name_candidate = re.sub(r"\b(private|pvt|ltd|llp|inc|technologies|tech|works|solutions)\b", "", name_candidate, flags=re.I).strip()
+
+    data["name"] = (name_candidate or "").strip()
+
+    # ADDRESS extraction
     address_lines = []
     for l in lines:
-        if re.search(r"\d.*(street|st|road|rd|nagar|lane|city|tamilnadu|india|pincode|pin|641|\bnear\b|\bopp\b)", l, re.I):
+        if re.search(r"\b\d{6}\b", l) or re.search(r"\b(?:street|st|road|rd|nagar|lane|peelamedu|city|tamil nadu|coimbatore|near|opp)\b", l, re.I):
             address_lines.append(l)
     if address_lines:
         data["address"] = ", ".join(address_lines)
 
-    # Trim
-    for k in ["name", "designation", "company", "address", "email", "website"]:
+    # Trim & cleanup
+    for k in ["name", "designation", "company", "address", "email", "website", "more_details"]:
         if isinstance(data.get(k), str):
             data[k] = data[k].strip()
+
+    data["name"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("name", ""))
+    data["company"] = re.sub(r"^[\W_]+|[\W_]+$", "", data.get("company", ""))
 
     return data
 
 # -----------------------------------------
-# Helper timestamp
+# Timestamp helper
 # -----------------------------------------
 def now_ist() -> str:
     ist = pytz.timezone("Asia/Kolkata")
     return datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S")
+
+# -----------------------------------------
+# Classification helpers (unchanged)
+# -----------------------------------------
+SOCIAL_PLATFORMS = {
+    "linkedin": ["linkedin.com", "linkedin"],
+    "twitter": ["twitter.com", "x.com", "t.co", "twitter"],
+    "instagram": ["instagram.com", "instagr.am", "instagram"],
+    "facebook": ["facebook.com", "fb.me", "facebook"],
+    "telegram": ["t.me", "telegram.me", "telegram"],
+    "whatsapp": ["wa.me", "whatsapp"]
+}
+
+COMPANY_KEYWORDS_LABELS = [
+    ("Pvt Ltd", ["pvt ltd", "private limited", "pvt. ltd"]),
+    ("Ltd", ["ltd", "limited"]),
+    ("Inc", ["inc", "inc."]),
+    ("LLP", ["llp"]),
+    ("Solutions", ["solutions"]),
+    ("Technologies", ["technologies", "tech"]),
+    ("Works", ["works"])
+]
+
+ADDRESS_COUNTRY_KEYWORDS = {
+    "India": ["india", "tamilnadu", "mumbai", "delhi", "bangalore", "chennai", "pincode", "pin"],
+    "USA": ["usa", "united states", "california", "ny", "new york", "zip"],
+    "UK": ["united kingdom", "england", "london", "uk"],
+}
+
+def _detect_social_platforms(links: List[str]) -> List[str]:
+    found = set()
+    for link in links or []:
+        low = link.lower()
+        for platform, tests in SOCIAL_PLATFORMS.items():
+            if any(t in low for t in tests):
+                found.add(platform)
+    return sorted(found)
+
+def _guess_company_type(company: str) -> str:
+    if not company:
+        return ""
+    low = company.lower()
+    for label, keywords in COMPANY_KEYWORDS_LABELS:
+        for kw in keywords:
+            if kw in low:
+                return label
+    return ""
+
+def _guess_address_country(address: str) -> str:
+    if not address:
+        return ""
+    low = address.lower()
+    for country, keys in ADDRESS_COUNTRY_KEYWORDS.items():
+        for k in keys:
+            if k in low:
+                return country
+    return ""
+
+def parse_phones(phone_list: List[str]) -> List[Dict[str, Any]]:
+    out = []
+    for raw in phone_list or []:
+        candidate = re.sub(r"[^\d\+xX]", "", raw)
+        try:
+            parsed = phonenumbers.parse(candidate, PHONE_DEFAULT_REGION)
+            is_valid = phonenumbers.is_valid_number(parsed)
+            e164 = phonenumbers.format_number(parsed, phonenumbers.PhoneNumberFormat.E164) if is_valid else candidate
+            phone_type = None
+            try:
+                phone_type = phonenumbers.number_type(parsed).name
+            except Exception:
+                phone_type = None
+            out.append({
+                "raw": raw,
+                "normalized": e164,
+                "country_code": getattr(parsed, "country_code", None),
+                "national_number": getattr(parsed, "national_number", None),
+                "valid": bool(is_valid),
+                "type": phone_type
+            })
+        except Exception:
+            out.append({
+                "raw": raw,
+                "normalized": None,
+                "country_code": None,
+                "national_number": None,
+                "valid": False,
+                "type": None
+            })
+    return out
+
+def classify_contact(contact: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate & enrich contact. Keeps field_validations but leaves more_details empty
+    unless provided by the caller (frontend controls it).
+    """
+    c = dict(contact)  # shallow copy
+
+    # Normalize types
+    phones = c.get("phone_numbers") or []
+    if isinstance(phones, str):
+        phones = [p.strip() for p in phones.split(",") if p.strip()]
+
+    socials = c.get("social_links") or []
+    if isinstance(socials, str):
+        socials = [s.strip() for s in socials.split(",") if s.strip()]
+
+    email = (c.get("email") or "").strip()
+    website = (c.get("website") or "").strip()
+    name = (c.get("name") or "").strip()
+    company = (c.get("company") or "").strip()
+    address = (c.get("address") or "").strip()
+    notes = (c.get("additional_notes") or "").strip()
+    designation = (c.get("designation") or "").strip()
+
+    # Email validation
+    email_valid = bool(validators.email(email)) if email else False
+
+    # Website validation & domain
+    website_valid = False
+    domain = ""
+    if website:
+        website_try = website if website.startswith(("http://", "https://")) else ("http://" + website)
+        website_valid = bool(validators.url(website_try))
+        te = tldextract.extract(website)
+        if te and te.domain:
+            domain = ".".join([p for p in [te.domain, te.suffix] if p])
+
+    # Phones parse
+    phones_parsed = parse_phones(phones)
+
+    # Social platform detection (include email + website)
+    social_platforms = _detect_social_platforms(socials + [website] + [email])
+
+    # Company type & address country
+    company_type = _guess_company_type(company)
+    address_country = _guess_address_country(address)
+
+    # Name heuristics
+    name_is_upper = bool(name and name.replace(" ", "").isupper())
+    name_word_count = len(name.split()) if name else 0
+
+    # NER quick check using spaCy (optional)
+    ner_org = ""
+    ner_gpe = ""
+    if nlp and (company or address or name):
+        try:
+            txt = " ".join([x for x in [name, company, address] if x])
+            doc = nlp(txt)
+            orgs = [ent.text for ent in doc.ents if ent.label_ == "ORG"]
+            gpes = [ent.text for ent in doc.ents if ent.label_ in ("GPE", "LOC")]
+            ner_org = orgs[0] if orgs else ""
+            ner_gpe = gpes[0] if gpes else ""
+        except Exception:
+            ner_org = ""
+            ner_gpe = ""
+
+    # Notes stats
+    notes_len = len(notes)
+    lines_in_notes = len([l for l in notes.splitlines() if l.strip()])
+
+    # Build structured validation doc
+    field_validations = {
+        "email": {"value": email, "valid": email_valid},
+        "website": {"value": website, "valid": website_valid, "domain": domain},
+        "phones": phones_parsed,
+        "social_platforms_detected": social_platforms,
+        "company_type_guess": company_type,
+        "address_country_hint": address_country,
+        "name": {"value": name, "is_uppercase": name_is_upper, "word_count": name_word_count},
+        "ner_org": ner_org,
+        "ner_gpe": ner_gpe,
+        "notes": {"length": notes_len, "lines": lines_in_notes},
+        "designation": {"value": designation}
+    }
+
+    c["field_validations"] = field_validations
+
+    # Keep more_details empty unless provided
+    if "more_details" not in c or not c.get("more_details"):
+        c["more_details"] = ""
+
+    # Ensure normalized types
+    c["phone_numbers"] = phones
+    c["social_links"] = socials
+
+    return c
 
 # -----------------------------------------
 # Routes
@@ -202,22 +642,89 @@ async def upload_card(file: UploadFile = File(...)):
     try:
         content = await file.read()
         img = Image.open(io.BytesIO(content))
-        text = pytesseract.image_to_string(img)
-        extracted = extract_details(text)
 
+        # PREPROCESS + OCR (robust)
+        try:
+            proc_img = preprocess_pil_image(img, upscale=True)
+
+            # choose OCR config; psm 6 is good for a block of text, adjust for layout
+            ocr_config = "--oem 3 --psm 6"
+            raw_text = pytesseract.image_to_string(proc_img, config=ocr_config, lang='eng')
+
+            # detailed data (word-level) — gives confidence, bbox, text
+            ocr_data = pytesseract.image_to_data(proc_img, config=ocr_config, lang='eng', output_type=Output.DICT)
+
+            # build a simple confidence summary
+            confidences = []
+            for c in ocr_data.get("conf", []):
+                try:
+                    # pytesseract may output "-1" or "-1\n"
+                    conf = int(float(c))
+                    confidences.append(conf)
+                except Exception:
+                    pass
+            avg_conf = sum(confidences)/len(confidences) if confidences else None
+
+        except Exception as e:
+            logging.exception("ocr preprocessing error")
+            raise HTTPException(status_code=500, detail=f"OCR processing failed: {e}")
+
+        # Extract structured details from OCR text
+        extracted = extract_details(raw_text)
+
+        # store debug fields to help triage poor OCR results
+        extracted["_raw_ocr_text"] = raw_text
+        extracted["_ocr_avg_confidence"] = avg_conf
+        extracted["_ocr_word_count"] = len([t for t in ocr_data.get("text", []) if t and t.strip()])
+
+        # optional: store low-confidence words (capped)
+        low_conf_words = []
+        try:
+            for i, w in enumerate(ocr_data.get("text", [])):
+                if not w or not w.strip():
+                    continue
+                try:
+                    conf = int(float(ocr_data.get("conf", [])[i]))
+                except Exception:
+                    conf = -1
+                if conf >= 0 and conf < 60:
+                    low_conf_words.append({"word": w, "conf": conf})
+            extracted["_ocr_low_conf_words"] = low_conf_words[:40]
+        except Exception:
+            # non-fatal: don't block processing if this debug step fails
+            extracted["_ocr_low_conf_words"] = []
+
+        # classify & enrich before storing (computes validations but leaves more_details empty)
+        extracted = classify_contact(extracted)
+
+        # ensure more_details is empty for newly created records (user will fill later)
+        extracted["more_details"] = ""
         extracted["created_at"] = now_ist()
         extracted["edited_at"] = ""
 
         result = collection.insert_one(extracted)
         inserted = collection.find_one({"_id": result.inserted_id})
         return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.exception("upload_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/create_card", status_code=status.HTTP_201_CREATED)
 async def create_card(payload: ContactCreate):
     try:
         doc = payload.dict()
+
+        # classify & enrich before insert/update
+        doc = classify_contact(doc)
+
+        # If user provided more_details in payload, keep it (manual create)
+        if payload.more_details:
+            doc["more_details"] = payload.more_details
+        else:
+            doc["more_details"] = ""
+
         doc["created_at"] = now_ist()
         doc["edited_at"] = ""
 
@@ -225,7 +732,9 @@ async def create_card(payload: ContactCreate):
         if doc.get("email"):
             existing = collection.find_one({"email": doc["email"]})
             if existing:
-                # merge/overwrite fields and set edited_at
+                # preserve existing more_details if user didn't provide one
+                if not doc.get("more_details"):
+                    doc["more_details"] = existing.get("more_details", "")
                 doc["edited_at"] = now_ist()
                 collection.update_one({"_id": existing["_id"]}, {"$set": doc})
                 updated = collection.find_one({"_id": existing["_id"]})
@@ -235,6 +744,7 @@ async def create_card(payload: ContactCreate):
         inserted = collection.find_one({"_id": result.inserted_id})
         return {"message": "Inserted Successfully", "data": JSONEncoder.encode(inserted)}
     except Exception as e:
+        logging.exception("create_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/all_cards")
@@ -243,6 +753,7 @@ def get_all_cards():
         docs = list(collection.find().sort([("_id", -1)]))
         return {"data": JSONEncoder.encode(docs)}
     except Exception as e:
+        logging.exception("get_all_cards error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.put("/update_notes/{card_id}")
@@ -257,6 +768,7 @@ def update_notes(card_id: str, payload: dict = Body(...)):
         updated = collection.find_one({"_id": ObjectId(card_id)})
         return {"message": "Updated", "data": JSONEncoder.encode(updated)}
     except Exception as e:
+        logging.exception("update_notes error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.patch("/update_card/{card_id}")
@@ -265,18 +777,43 @@ def update_card(card_id: str, payload: dict = Body(...)):
         allowed_fields = {
             "name", "designation", "company", "phone_numbers",
             "email", "website", "address", "social_links",
-            "additional_notes"
+            "additional_notes", "more_details"
         }
 
         update_data = {k: v for k, v in payload.items() if k in allowed_fields}
         if not update_data:
             raise HTTPException(status_code=400, detail="No valid fields to update.")
 
-        update_data["edited_at"] = now_ist()
-        collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_data})
+        # fetch existing doc
+        existing = collection.find_one({"_id": ObjectId(card_id)})
+        if not existing:
+            raise HTTPException(status_code=404, detail="Card not found.")
+
+        existing_more = existing.get("more_details", "")
+
+        merged = dict(existing)
+        merged.update(update_data)
+
+        # classify -> returns normalized phone/socials and adds field_validations
+        merged = classify_contact(merged)
+
+        # ensure more_details: if user provided it in update_data, keep that; otherwise preserve existing
+        if "more_details" in update_data:
+            merged["more_details"] = update_data.get("more_details", "")
+        else:
+            merged["more_details"] = existing_more
+
+        # pick only allowed fields + classification fields to set
+        set_payload = {k: merged.get(k) for k in list(allowed_fields) + ["field_validations"]}
+        set_payload["edited_at"] = now_ist()
+
+        collection.update_one({"_id": ObjectId(card_id)}, {"$set": set_payload})
         updated = collection.find_one({"_id": ObjectId(card_id)})
         return {"message": "Updated", "data": JSONEncoder.encode(updated)}
+    except HTTPException:
+        raise
     except Exception as e:
+        logging.exception("update_card error")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/delete_card/{card_id}", status_code=status.HTTP_200_OK)
@@ -288,4 +825,5 @@ def delete_card(card_id: str):
         else:
             raise HTTPException(status_code=404, detail="Card not found.")
     except Exception as e:
+        logging.exception("delete_card error")
         raise HTTPException(status_code=500, detail=str(e))
