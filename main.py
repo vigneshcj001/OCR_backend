@@ -1,4 +1,23 @@
 # backend.py
+"""
+Business Card OCR Backend (OpenAI required + MongoDB)
+
+Features:
+- Image preprocessing (grayscale, upscale, denoise, adaptive threshold, optional deskew)
+- Multi-PSM Tesseract attempts, picks best by mean confidence
+- Rotation fallback (90/270) for sideways images
+- Local regex-based parsing for fallback/augmentation
+- Required OpenAI parsing to extract structured fields (phone_numbers and social_links enforced as lists)
+- Safer update endpoint: only $set fields intentionally provided by client
+- MongoDB persistence and vCard generation
+
+Requirements (Python packages):
+    pip install fastapi uvicorn python-multipart pillow pytesseract pymongo openai numpy
+System-level:
+    - Install Tesseract OCR on host (apt, brew, or Windows installer)
+    - If Tesseract binary isn't on PATH, set TESSERACT_PATH env var to full path
+"""
+
 import os
 import io
 import re
@@ -14,18 +33,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from pymongo import MongoClient
 from bson import ObjectId
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import pytesseract
+import numpy as np
 
-# OpenAI client (required)
+# OpenAI (required)
 from openai import OpenAI
 
 # -----------------------
-# Requirements:
-# pip install fastapi uvicorn python-multipart pillow pytesseract pymongo openai
-# Tesseract binary must be installed on host (apt / brew / Windows installer).
+# Logging & config
 # -----------------------
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("business-card-backend")
 
@@ -42,7 +59,7 @@ if TESSERACT_PATH:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
 
 # -----------------------
-# Helpers & normalization
+# Utilities
 # -----------------------
 def now_iso() -> str:
     return datetime.utcnow().isoformat() + "Z"
@@ -65,6 +82,7 @@ def _ensure_list(v) -> List[str]:
 def clean_ocr_text(text: str) -> str:
     text = re.sub(r"\r", "\n", text)
     text = re.sub(r"\n{2,}", "\n", text)
+    # trim long leading/trailing whitespace
     return text.strip()
 
 def normalize_payload(payload: dict) -> dict:
@@ -109,7 +127,7 @@ def db_doc_to_canonical(doc: dict) -> dict:
     return canonical
 
 # -----------------------
-# Local regex-based extractor (improved)
+# Local regex-based extractor
 # -----------------------
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", re.I)
 
@@ -294,20 +312,130 @@ def local_parse_from_ocr(ocr_text: str) -> Tuple[Dict[str, Any], str]:
     return parsed, parsed["confidence_notes"]
 
 # -----------------------
+# OCR Preprocessing + Multi-PSM logic
+# -----------------------
+def preprocess_image_for_ocr(image: Image.Image, upscale_to: int = 1600, do_deskew: bool = True) -> Image.Image:
+    """
+    Convert to grayscale, upscale if small, denoise, sharpen, simple adaptive threshold and optional deskew via tesseract OSD.
+    """
+    img = image.convert("L")
+
+    # upscale if small
+    try:
+        max_dim = max(img.size)
+        if max_dim < upscale_to:
+            ratio = upscale_to / max_dim
+            new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+    except Exception:
+        pass
+
+    # median denoise and mild sharpening
+    try:
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(1.2)
+    except Exception:
+        pass
+
+    # adaptive-like threshold via numpy (fast & crude)
+    try:
+        arr = np.array(img).astype(np.uint8)
+        mean = int(arr.mean())
+        # Slight offset to preserve lighter text
+        thresh = mean - 10
+        arr = np.where(arr > thresh, 255, 0).astype(np.uint8)
+        img = Image.fromarray(arr)
+    except Exception:
+        pass
+
+    # Optional deskew using tesseract OSD if available
+    if do_deskew:
+        try:
+            osd = pytesseract.image_to_osd(img)
+            m = re.search(r"Rotate:\s+(\d+)", osd)
+            if m:
+                rot = int(m.group(1))
+                if rot and rot % 360 != 0:
+                    img = img.rotate(360 - rot, expand=True)
+        except Exception:
+            pass
+
+    return img
+
+def ocr_try_multiple_psm(img: Image.Image, psm_choices=(6, 3, 11)) -> Tuple[str, dict]:
+    """
+    Try several Tesseract PSMs and return the best text with metadata.
+    psm_choices: try order; returns best by mean word confidence.
+    """
+    best = {"text": "", "mean_conf": -999.0, "raw": None, "psm": None, "data": None}
+    for psm in psm_choices:
+        config = f"--psm {psm} --oem 3"
+        try:
+            data = pytesseract.image_to_data(img, config=config, output_type=pytesseract.Output.DICT)
+            words = []
+            confs = []
+            for t, c in zip(data.get("text", []), data.get("conf", [])):
+                if t and str(t).strip():
+                    words.append(str(t).strip())
+                    try:
+                        cnum = float(c)
+                    except Exception:
+                        cnum = -1.0
+                    confs.append(cnum)
+            text = " ".join(words).strip()
+            mean_conf = float(np.mean([c for c in confs if c >= 0])) if any(c >= 0 for c in confs) else -1.0
+            # choose higher mean_conf, tie-breaker: longer text
+            if mean_conf > best["mean_conf"] or (abs(mean_conf - best["mean_conf"]) < 1e-6 and len(text) > len(best["text"])):
+                best.update({"text": text, "mean_conf": mean_conf, "raw": data, "psm": psm, "data": data})
+        except Exception:
+            # fallback to simpler API if image_to_data fails
+            try:
+                txt = pytesseract.image_to_string(img, config=config)
+                txt = txt.strip()
+                if len(txt) > len(best["text"]):
+                    best.update({"text": txt, "mean_conf": -1.0, "raw": None, "psm": psm, "data": None})
+            except Exception:
+                pass
+
+    # Fallback: if nothing returned, try default image_to_string
+    if not best["text"]:
+        try:
+            txt = pytesseract.image_to_string(img)
+            best.update({"text": txt.strip(), "mean_conf": -1.0, "raw": None, "psm": None, "data": None})
+        except Exception:
+            pass
+
+    return best["text"], {"mean_conf": best["mean_conf"], "psm": best["psm"], "raw": best["raw"]}
+
+# -----------------------
 # OpenAI parsing wrapper (required)
 # -----------------------
 PARSER_PROMPT = (
     "You are an assistant that extracts structured contact fields from messy OCR'd text from a business card.\n"
-    "Return a JSON object with keys: name, company, title, email, phone, website, address, extra, confidence_notes.\n"
-    "If a field is not present, set it to null. For 'extra' include any other useful strings (fax, linkedin, notes).\n"
-    "Respond ONLY with the JSON object.\n"
+    "Return a JSON object with keys exactly: name, company, title, email, phone, phone_numbers, website, address, social_links, extra, confidence_notes.\n"
+    "Rules:\n"
+    " - phone_numbers must be a JSON list of phone strings (can be empty list if none).\n"
+    " - social_links must be a JSON list of URLs or handles (empty list if none).\n"
+    " - phone may be the primary single phone string or null.\n"
+    " - If a field is not present, set it to null (or an empty list for phone_numbers/social_links).\n"
+    " - For 'extra' include any other useful strings (fax, linkedin, notes) as an object.\n"
+    " - Respond with JSON only, no surrounding text.\n"
+    "Example:\n"
+    '{"name": "Alice Doe", "company": "Acme Pvt Ltd", "title": "CTO", "email": "alice@acme.com", "phone": null, "phone_numbers": ["+911234567890"], "website": "https://acme.com", "address": "123, Road, City", "social_links": ["https://www.linkedin.com/in/alicedoe"], "extra": {}, "confidence_notes": "email_ok;phone_ok"}\n'
 )
 
 def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dict[str, Any]:
+    """
+    Calls OpenAI (via OpenAI Python client) to parse OCR text into structured JSON.
+    Raises RuntimeError if api_key is missing.
+    Returns a dict with expected keys (phone_numbers and social_links ensured as lists).
+    """
     if not api_key:
         raise RuntimeError("OpenAI API key is required for parsing.")
     client = OpenAI(api_key=api_key)
     prompt = PARSER_PROMPT + "\nOCR_TEXT:\n" + ocr_text + "\n\nRespond with JSON only."
+
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -326,8 +454,10 @@ def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dic
             "title": None,
             "email": None,
             "phone": None,
+            "phone_numbers": [],
             "website": None,
             "address": None,
+            "social_links": [],
             "extra": {"openai_error": str(e), "traceback": traceback.format_exc()},
             "confidence_notes": f"OpenAI call failed: {e}"
         }
@@ -339,28 +469,45 @@ def call_openai_parse(ocr_text: str, api_key: str, model: str = "gpt-4o") -> Dic
 
     try:
         parsed = json.loads(assistant_text)
+        # normalize presence of lists
+        if "phone_numbers" not in parsed:
+            if parsed.get("phone"):
+                parsed["phone_numbers"] = _ensure_list(parsed.get("phone"))
+            else:
+                parsed["phone_numbers"] = []
+        if "social_links" not in parsed:
+            parsed["social_links"] = parsed.get("social_links") or []
         return parsed
     except Exception:
+        # try to extract JSON object at end of text
         m = re.search(r"\{[\s\S]*\}$", assistant_text)
         if m:
             try:
-                return json.loads(m.group(0))
+                parsed = json.loads(m.group(0))
+                if "phone_numbers" not in parsed:
+                    parsed["phone_numbers"] = parsed.get("phone") and _ensure_list(parsed.get("phone")) or []
+                if "social_links" not in parsed:
+                    parsed["social_links"] = parsed.get("social_links") or []
+                return parsed
             except Exception:
                 pass
+
         return {
             "name": None,
             "company": None,
             "title": None,
             "email": None,
             "phone": None,
+            "phone_numbers": [],
             "website": None,
             "address": None,
+            "social_links": [],
             "extra": {"model_output": assistant_text},
             "confidence_notes": "Model output not parseable as JSON. See extra.model_output."
         }
 
 # -----------------------
-# FastAPI + endpoints
+# FastAPI app & endpoints
 # -----------------------
 app = FastAPI(title="Business Card OCR Backend (OpenAI required + MongoDB)")
 
@@ -394,6 +541,9 @@ async def ping():
 
 @app.post("/extract", response_model=ExtractedContact)
 async def extract_card(file: UploadFile = File(...), authorization: Optional[str] = Header(None), model: Optional[str] = "gpt-4o"):
+    """
+    Upload image -> preprocess -> OCR (multi-psm, rotation fallback) -> local parse -> OpenAI parse (required) -> merge -> return structured fields.
+    """
     # require api key via header or env
     api_key = None
     if authorization and authorization.lower().startswith("bearer "):
@@ -414,33 +564,43 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
         logger.exception("Invalid image uploaded")
         return JSONResponse(status_code=400, content={"detail": f"Invalid image: {e}", "traceback": traceback.format_exc()})
 
+    # Preprocess image (deskew, enhance, threshold, upscale)
     try:
-        max_dim = 1800
-        if max(image.size) > max_dim:
-            ratio = max_dim / max(image.size)
-            image = image.resize((int(image.size[0] * ratio), int(image.size[1] * ratio)))
+        pre = preprocess_image_for_ocr(image, upscale_to=1600, do_deskew=True)
     except Exception:
-        logger.exception("resize failed; continuing")
+        pre = image.convert("L")
 
+    # Try multiple Tesseract PSMs and pick best by mean confidence
+    ocr_text, ocr_meta = ocr_try_multiple_psm(pre, psm_choices=(6, 3, 11))
+
+    # If OCR text is short or low confidence, try additional rotations (portrait / transposed)
     try:
-        raw_text = pytesseract.image_to_string(image)
-    except Exception as e:
-        logger.exception("OCR failed")
-        return JSONResponse(status_code=500, content={"detail": f"OCR failure: {e}", "traceback": traceback.format_exc()})
+        if (not ocr_text or len(ocr_text.strip()) < 20) or (ocr_meta.get("mean_conf", -1) != -1 and ocr_meta.get("mean_conf") < 40):
+            for rot in (90, 270):
+                try:
+                    rot_img = pre.rotate(rot, expand=True)
+                    ttext, tmeta = ocr_try_multiple_psm(rot_img, psm_choices=(6, 3, 11))
+                    if len(ttext) > len(ocr_text) and (tmeta.get("mean_conf", -1) > ocr_meta.get("mean_conf", -1)):
+                        ocr_text = ttext
+                        ocr_meta = tmeta
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
-    raw_text_clean = clean_ocr_text(raw_text)
+    raw_text_clean = clean_ocr_text(ocr_text)
 
     # local parse (always)
     local_parsed, local_notes = local_parse_from_ocr(raw_text_clean)
 
-    # REQUIRED: call OpenAI parser
+    # REQUIRED: call OpenAI parser (send the cleaned OCR text)
     openai_parsed = call_openai_parse(raw_text_clean, api_key=api_key, model=model)
 
-    # Merge: prefer OpenAI value if present, otherwise local
+    # Merge: prefer OpenAI value if present and non-empty, otherwise local
     merged = {}
     def pick(key):
         v = openai_parsed.get(key)
-        if v is not None and v != "":
+        if v is not None and v != "" and v != []:
             return v
         return local_parsed.get(key)
 
@@ -448,14 +608,13 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
     merged["designation"] = pick("title") or pick("designation")
     merged["company"] = pick("company")
 
-    # Phones: handle string vs list and local extras
+    # Phones: prioritize OpenAI phone_numbers (list); otherwise local extras
     phones_candidate = None
-    for k in ("phone_numbers", "phone"):
-        val = openai_parsed.get(k)
-        if val:
-            phones_candidate = val
-            break
-    if not phones_candidate:
+    if openai_parsed.get("phone_numbers"):
+        phones_candidate = openai_parsed.get("phone_numbers")
+    elif openai_parsed.get("phone"):
+        phones_candidate = _ensure_list(openai_parsed.get("phone"))
+    else:
         phones_candidate = local_parsed.get("extra", {}).get("phones_all") or local_parsed.get("phone")
 
     merged["phone_numbers"] = _ensure_list(phones_candidate)
@@ -465,12 +624,9 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
     merged["address"] = pick("address")
 
     social_candidate = None
-    for k in ("social_links", "linkedin"):
-        val = openai_parsed.get(k)
-        if val:
-            social_candidate = val
-            break
-    if not social_candidate:
+    if openai_parsed.get("social_links"):
+        social_candidate = openai_parsed.get("social_links")
+    else:
         social_candidate = local_parsed.get("extra", {}).get("linkedin") or local_parsed.get("extra", {}).get("websites_all")
     merged["social_links"] = _ensure_list(social_candidate)
 
@@ -483,11 +639,16 @@ async def extract_card(file: UploadFile = File(...), authorization: Optional[str
         cn.append(f"openai:{openai_parsed.get('confidence_notes')}")
     if local_parsed.get("confidence_notes"):
         cn.append(f"local:{local_parsed.get('confidence_notes')}")
+    # include OCR meta confidence for diagnostics
+    cn.append(f"ocr_mean_conf:{int(ocr_meta.get('mean_conf', -1))}")
+    if ocr_meta.get("psm"):
+        cn.append(f"ocr_psm:{ocr_meta.get('psm')}")
     merged["confidence_notes"] = ";".join(cn) if cn else "none"
 
     merged["extra"] = {
         "local": local_parsed.get("extra", {}),
         "openai": openai_parsed.get("extra", {}),
+        "ocr_meta": ocr_meta,
     }
 
     return JSONResponse(status_code=200, content=merged)
@@ -563,29 +724,37 @@ def update_notes(card_id: str, payload: dict = Body(...)):
 
 @app.patch("/update_card/{card_id}")
 def update_card(card_id: str, payload: dict = Body(...)):
+    """
+    Safer update: normalize payload and only $set fields that are intentionally provided.
+    Empty lists are respected (they clear fields). None/empty strings are ignored unless user explicitly sets.
+    """
     try:
         allowed_fields = {
             "name", "designation", "company", "phone_numbers",
             "email", "website", "address", "social_links",
             "additional_notes", "more_details"
         }
-        # Normalize incoming payload (strings -> lists etc.)
         normalized = normalize_payload(payload)
-        # Keep only allowed fields that the client actually sent (and that are not None or empty strings).
-        # Note: empty lists are allowed and will clear the field intentionally.
-        update_data = {
-            k: v for k, v in normalized.items()
-            if k in allowed_fields and not (v is None or (isinstance(v, str) and v.strip() == ""))
-        }
+        # Keep fields that are allowed and not None/empty-string.
+        # Note: we DO allow empty lists for phone_numbers/social_links to clear them intentionally.
+        update_data: Dict[str, Any] = {}
+        for k, v in normalized.items():
+            if k not in allowed_fields:
+                continue
+            if v is None:
+                continue
+            if isinstance(v, str) and v.strip() == "":
+                continue
+            # Accept empty lists
+            update_data[k] = v
+
         if not update_data:
             raise HTTPException(status_code=400, detail="No valid fields to update.")
 
-        # Ensure the card exists
         existing = collection.find_one({"_id": ObjectId(card_id)})
         if not existing:
             raise HTTPException(status_code=404, detail="Card not found.")
 
-        # Set edited_at and update only the changed fields
         update_data["edited_at"] = now_iso()
         collection.update_one({"_id": ObjectId(card_id)}, {"$set": update_data})
         updated = collection.find_one({"_id": ObjectId(card_id)})
@@ -609,7 +778,7 @@ def delete_card(card_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 # -----------------------
-# vCard helper (placed after endpoints for clarity)
+# vCard helper
 # -----------------------
 def generate_vcard(data: Dict[str, Optional[str]]) -> str:
     lines = ["BEGIN:VCARD", "VERSION:3.0"]
