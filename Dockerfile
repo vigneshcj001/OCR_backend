@@ -1,29 +1,22 @@
-# ------------ BASE PYTHON IMAGE ------------
+
 FROM python:3.10-slim
 
-# ------------ WORKDIR ------------
 WORKDIR /app
 
-# ------------ INSTALL SYSTEM DEPENDENCIES ------------
+# Install Tesseract OCR dependencies
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-        tesseract-ocr \
-        libtesseract-dev \
-        libleptonica-dev \
-        libgl1 \
-        libglib2.0-0 \
-        build-essential \
-        pkg-config \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get install -y tesseract-ocr libleptonica-dev libtesseract-dev && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ------------ COPY PROJECT FILES ------------
+# Copy project files
 COPY . .
 
-# ------------ INSTALL PYTHON DEPENDENCIES ------------
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -m spacy download en_core_web_sm
 
-# ------------ EXPOSE PORT ------------
+# Expose port
 EXPOSE 8000
 
-# ------------ START FASTAPI SERVER ------------
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Default command to run FastAPI
+CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
